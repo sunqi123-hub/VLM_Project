@@ -1,6 +1,0 @@
-Pillow
-requests
-accelerate
-torch
-transformers
-bitsandbytes
