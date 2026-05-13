@@ -36,10 +36,51 @@ To train your own model:
 ```python
 python blip2_detect.py --dataset ./data/train.csv --epochs 20 --lr 5e-5 
 ```
+
+### GNN-CoT Extension
+
+This fork adds an optional research branch for explainable synthetic image detection:
+
+- A visual-text heterogeneous graph head builds spatial patch nodes, frequency patch nodes, and text prompt nodes, then performs topology-aware message passing before fake/real classification.
+- A structured CoT target changes the answer from a single word to four forensic steps: quick intuition, salient evidence, deep reasoning, and final conclusion.
+- An RLHF-style differentiable reward can use the final answer, report structure, graph-label alignment, and an optional human feedback score column.
+
+Example training command:
+
+```python
+python blip2_detect_aligned.py \
+    --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
+    --base_model ./blip2-opt-2.7b \
+    --epochs 20 \
+    --batch_size 32 \
+    --save_path ./SaveFineTune/LDM-gnn-cot \
+    --use_gnn_cot
+```
+
+If the CSV contains a human feedback score, pass its column name. The score may be in 0-1, 1-5, or 0-100 format:
+
+```python
+python blip2_detect_aligned.py \
+    --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
+    --base_model ./blip2-opt-2.7b \
+    --save_path ./SaveFineTune/LDM-gnn-cot-feedback \
+    --use_gnn_cot \
+    --rlhf_feedback_col human_score
+```
 ## Evaluation
 To run the test on specific dataset, use the following command:
 ```python
 python blip2_test.py --model_path ./weights/ldmFineTune --dataset ./data/test.csv
+```
+
+For the GNN-CoT branch, load both the LoRA checkpoint and the saved graph head:
+
+```python
+python blip2_test004.py \
+    --model_path ./SaveFineTune/LDM-gnn-cot/epoch020 \
+    --gnn_head_path ./SaveFineTune/LDM-gnn-cot/epoch020/gnn_cot_head.pt \
+    --dataset ./data/Test_CSV/test_LDM.csv \
+    --structured_cot
 ```
 Or Run the test on all the testing subset 
 ```python

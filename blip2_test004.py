@@ -42,7 +42,10 @@ from peft import PeftModel
 import tqdm
 import time
 import argparse
+import re
+from PIL import Image
 import matplotlib.font_manager as fm  # 添加这行导入语句
+from gnn_cot import format_top_patches, load_gnn_cot_head
 
 import warnings  # 后加
 import logging
@@ -73,6 +76,13 @@ TARGET_SAVE_DIR = "./Test-Results/GAN/In_PNDM_Results/aligned-sample500-00020-In
 # 确保目标目录存在，不存在则创建
 os.makedirs(TARGET_SAVE_DIR, exist_ok=True)
 
+PROMPT_TEXT = "Is this image fake or real? Answer ONLY with 'fake' or 'real' (no extra words)."
+STRUCTURED_COT_PROMPT = (
+    "You are a forensic image analyst. Decide whether the image is fake or real. "
+    "Return exactly four lines with these fields: Quick intuition, Salient evidence, "
+    "Deep reasoning, Final conclusion."
+)
+
 
 # ===========================
 # 辅助函数定义
@@ -91,6 +101,35 @@ def map_text_to_binary(text):
     else:
         print(f"[警告] 无法识别文本: '{text}'，默认标记为0（real）")
         return 0
+
+
+def extract_final_label(text):
+    """Prefer the explicit final conclusion in a structured CoT report."""
+    text_lower = str(text).lower().strip()
+    final_match = re.search(r"final\s*(?:conclusion|answer)?\s*[:：]\s*(fake|real)", text_lower)
+    if final_match:
+        return 1 if final_match.group(1) == "fake" else 0
+
+    for line in reversed(text_lower.splitlines()):
+        if "fake" in line:
+            return 1
+        if "real" in line:
+            return 0
+    return map_text_to_binary(text)
+
+
+def label_to_text(label):
+    return "fake" if int(label) == 1 else "real"
+
+
+def move_inputs_to_device(inputs, device):
+    moved = {}
+    for key, value in inputs.items():
+        if key == "pixel_values":
+            moved[key] = value.to(device=device, dtype=torch.float16)
+        else:
+            moved[key] = value.to(device=device)
+    return moved
 
 
 # def plot_single_roc(y_true, y_pred, dataset_name, save_path):
@@ -200,7 +239,7 @@ def generate_performance_table(all_results, save_path):
     plt.close()
 
 
-def process_dataset(dataset_path, model, processor, device, opt):
+def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     """处理单个数据集并返回结果"""
     # 提取数据集名称
     dataset_name = os.path.basename(dataset_path).split('.')[0].replace('test_', '')
@@ -215,40 +254,78 @@ def process_dataset(dataset_path, model, processor, device, opt):
 
     # 推理阶段
     results = []
+    text_results = []
+    cot_reports = []
+    gnn_fake_probs = []
+    gnn_evidence = []
     start_time = time.time()
-    prompt_text = "Is this image fake or real? Answer ONLY with 'fake' or 'real' (no extra words)."
+    prompt_text = STRUCTURED_COT_PROMPT if opt.structured_cot else PROMPT_TEXT
+    max_new_tokens = opt.max_new_tokens if opt.structured_cot else 1
 
     for i, row in tqdm.tqdm(test_df.iterrows(), total=len(test_df), desc=f"Testing {dataset_name}"):
         image_path = row["image"]
         if not os.path.exists(image_path):
             print(f"[跳过] 找不到图像: {image_path}")
+            results.append("error")
+            text_results.append("error")
+            cot_reports.append("missing image")
+            gnn_fake_probs.append(np.nan)
+            gnn_evidence.append("")
             continue
 
         try:
             # 处理输入
-            inputs = processor(
-                images=image_path,
+            image = Image.open(image_path).convert("RGB")
+            inputs = move_inputs_to_device(processor(
+                images=image,
                 text=prompt_text,
                 return_tensors="pt"
-            ).to(device, torch.float16)
+            ), device)
 
             # 执行推理
             with torch.no_grad():
                 generated_ids = model.generate(
                     **inputs,
-                    max_new_tokens=1,
+                    max_new_tokens=max_new_tokens,
                     num_beams=3,
                     do_sample=False
                 )
+                graph_prob_fake = np.nan
+                graph_label = None
+                evidence_text = ""
+                if gnn_head is not None:
+                    graph_outputs = gnn_head(
+                        pixel_values=inputs["pixel_values"],
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                    )
+                    graph_prob_fake = graph_outputs["logits"].softmax(dim=-1)[0, 1].item()
+                    graph_label = int(graph_prob_fake >= 0.5)
+                    evidence = format_top_patches(graph_outputs, top_k=opt.gnn_top_k)
+                    evidence_text = evidence[0] if evidence else ""
 
             # 解码结果
             pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             pred_text = pred_text.replace(prompt_text, "").strip()
-            results.append(pred_text)
+            text_label = extract_final_label(pred_text) if opt.structured_cot else map_text_to_binary(pred_text)
+            final_label = text_label
+            if graph_label is not None:
+                fused_score = opt.gnn_vote_weight * graph_prob_fake + (1.0 - opt.gnn_vote_weight) * float(text_label)
+                final_label = int(fused_score >= 0.5)
+
+            results.append(label_to_text(final_label))
+            text_results.append(label_to_text(text_label))
+            cot_reports.append(pred_text)
+            gnn_fake_probs.append(graph_prob_fake)
+            gnn_evidence.append(evidence_text)
 
         except Exception as e:
             print(f"[错误] 图像 {image_path} 推理失败: {e}")
             results.append("error")
+            text_results.append("error")
+            cot_reports.append(f"error: {e}")
+            gnn_fake_probs.append(np.nan)
+            gnn_evidence.append("")
 
     end_time = time.time()
     print(f"[INFO] {dataset_name} 推理完成，耗时 {end_time - start_time:.2f} 秒")
@@ -259,6 +336,10 @@ def process_dataset(dataset_path, model, processor, device, opt):
         "GT": test_df["text"],
         "Tlabel": test_df["text"].apply(map_text_to_binary),
         "Pred": results,
+        "TextPred": text_results,
+        "GNNFakeProb": gnn_fake_probs,
+        "GNNEvidence": gnn_evidence,
+        "CoTReport": cot_reports,
         "Plabel": [map_text_to_binary(x) for x in results],
     })
 
@@ -323,7 +404,18 @@ if __name__ == "__main__":
                         help="Path to BLIP2 base model")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Optional: number of samples to test (randomly sampled)")
+    parser.add_argument("--structured_cot", action="store_true",
+                        help="生成 quick intuition / salient evidence / deep reasoning / final conclusion 四步报告")
+    parser.add_argument("--max_new_tokens", type=int, default=96,
+                        help="structured_cot 模式下的最大生成 token 数")
+    parser.add_argument("--gnn_head_path", type=str, default=None,
+                        help="可选：加载训练保存的 gnn_cot_head.pt，用图分支融合判决")
+    parser.add_argument("--gnn_vote_weight", type=float, default=0.5,
+                        help="融合判决时 GNN fake 概率的权重，范围 0-1")
+    parser.add_argument("--gnn_top_k", type=int, default=3,
+                        help="保存 GNN 证据热区时保留的 top-k patch 数")
     opt = parser.parse_args()
+    opt.gnn_vote_weight = min(max(opt.gnn_vote_weight, 0.0), 1.0)
 
     # ===========================
     # 模型加载
@@ -342,11 +434,16 @@ if __name__ == "__main__":
     model.eval()
 
     processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=True)
+    gnn_head = None
+    if opt.gnn_head_path is not None:
+        print(f"[INFO] 加载 GNN-CoT 头: {opt.gnn_head_path}")
+        gnn_head = load_gnn_cot_head(opt.gnn_head_path, processor.tokenizer, map_location=device).to(device)
+        gnn_head.eval()
 
     # 处理所有数据集
     all_results = []
     for dataset_path in opt.dataset:
-        result = process_dataset(dataset_path, model, processor, device, opt)
+        result = process_dataset(dataset_path, model, processor, device, opt, gnn_head=gnn_head)
         all_results.append(result)
 
     # 生成汇总ROC曲线（核心修改点5：改为目标目录）
