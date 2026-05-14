@@ -10,6 +10,17 @@ python blip2_detect_aligned.py \
     --batch_size 32 \
     --save_path ./SaveFineTune/LDM-train-aligned--epochs0020
 
+python blip2_detect_aligned.py \
+  --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
+  --base_model ./blip2-opt-2.7b \
+  --epochs 20 \
+  --batch_size 8 \
+  --num_workers 0 \
+  --save_path ./SaveFineTune/LDM-gnn-cot_test \
+  --use_gnn_cot \
+  --use_cot \
+  --cls_loss_weight 1.0
+
 """
 
 import os
@@ -584,7 +595,7 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--cls_loss_weight", type=float, default=0.0,
+    parser.add_argument("--cls_loss_weight", type=float, default=0.5,
                         help="Optional auxiliary fake/real short-answer LM loss weight.")
 
     # GNN-CoT research branch.
@@ -598,10 +609,10 @@ def parse_args():
     parser.add_argument("--gnn_layers", type=int, default=2)
     parser.add_argument("--gnn_heads", type=int, default=4)
     parser.add_argument("--gnn_dropout", type=float, default=0.1)
-    parser.add_argument("--gnn_loss_weight", type=float, default=0.5)
+    parser.add_argument("--gnn_loss_weight", type=float, default=0.3)
 
     # Differentiable RLHF-style reward proxy.
-    parser.add_argument("--rlhf_reward_weight", type=float, default=0.2)
+    parser.add_argument("--rlhf_reward_weight", type=float, default=0.05)
     parser.add_argument("--rlhf_final_weight", type=float, default=0.4)
     parser.add_argument("--rlhf_structure_weight", type=float, default=0.3)
     parser.add_argument("--rlhf_alignment_weight", type=float, default=0.3)
