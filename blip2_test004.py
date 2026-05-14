@@ -36,6 +36,7 @@ import matplotlib.pyplot as plt
 from dataset import ImageCaptioningDataset
 from torch.utils.data import DataLoader
 import torch
+import torch.nn.functional as F
 from transformers import AutoProcessor, Blip2ForConditionalGeneration
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, roc_curve, auc
 from peft import PeftModel
@@ -82,6 +83,23 @@ STRUCTURED_COT_PROMPT = (
     "Return exactly four lines with these fields: Quick intuition, Salient evidence, "
     "Deep reasoning, Final conclusion."
 )
+
+COT_TEMPLATES = {
+    0: (
+        "Quick intuition: real.\n"
+        "Salient evidence: no localized manipulation cue is dominant in the visible regions.\n"
+        "Deep reasoning: the spatial content and frequency texture are mutually consistent, "
+        "so the forensic evidence supports an authentic image.\n"
+        "Final conclusion: real."
+    ),
+    1: (
+        "Quick intuition: fake.\n"
+        "Salient evidence: localized visual artifacts and frequency inconsistency are suspicious.\n"
+        "Deep reasoning: the spatial content and frequency texture are not fully aligned, "
+        "so the forensic evidence supports a synthetic or manipulated image.\n"
+        "Final conclusion: fake."
+    ),
+}
 
 
 # ===========================
@@ -130,6 +148,72 @@ def move_inputs_to_device(inputs, device):
         else:
             moved[key] = value.to(device=device)
     return moved
+
+
+def find_subsequence(sequence, pattern):
+    if len(pattern) == 0 or len(pattern) > len(sequence):
+        return None
+    last_start = len(sequence) - len(pattern)
+    for start in range(last_start + 1):
+        if sequence[start : start + len(pattern)] == pattern:
+            return start
+    return None
+
+
+def build_labels_for_targets(input_ids, attention_mask, target_texts, tokenizer):
+    labels = torch.full_like(input_ids, fill_value=-100)
+    for row_idx, target_text in enumerate(target_texts):
+        target_ids = tokenizer(target_text, add_special_tokens=False).input_ids
+        valid_positions = attention_mask[row_idx].nonzero(as_tuple=False).flatten()
+        target_len = min(len(target_ids), int(valid_positions.numel()))
+        if target_len == 0:
+            continue
+        valid_token_ids = input_ids[row_idx, valid_positions].tolist()
+        match_start = find_subsequence(valid_token_ids, target_ids[:target_len])
+        if match_start is not None:
+            target_positions = valid_positions[match_start : match_start + target_len]
+        else:
+            target_positions = valid_positions[-target_len:]
+        labels[row_idx, target_positions] = input_ids[row_idx, target_positions]
+    return labels
+
+
+def class_targets_for_scoring(structured_cot):
+    if structured_cot:
+        return ["\n" + COT_TEMPLATES[0], "\n" + COT_TEMPLATES[1]]
+    return [" real", " fake"]
+
+
+def lm_fake_probability(model, processor, image, device, structured_cot):
+    prompt = STRUCTURED_COT_PROMPT if structured_cot else PROMPT_TEXT
+    target_texts = class_targets_for_scoring(structured_cot)
+    texts = [prompt + target_text for target_text in target_texts]
+    inputs = processor(images=[image, image], text=texts, return_tensors="pt", padding=True)
+    labels = build_labels_for_targets(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        target_texts=target_texts,
+        tokenizer=processor.tokenizer,
+    ).to(device)
+    inputs = move_inputs_to_device(inputs, device)
+
+    outputs = model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        pixel_values=inputs["pixel_values"],
+    )
+    shift_logits = outputs.logits[:, :-1, :].contiguous().float()
+    shift_labels = labels[:, 1:].contiguous()
+    token_loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view(shift_labels.shape)
+    label_mask = shift_labels.ne(-100)
+    nll = (token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp_min(1)
+    probs = torch.softmax(-nll, dim=0)
+    return probs[1].item()
 
 
 # def plot_single_roc(y_true, y_pred, dataset_name, save_path):
@@ -255,8 +339,10 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     # 推理阶段
     results = []
     text_results = []
+    lm_fake_probs = []
     cot_reports = []
     gnn_fake_probs = []
+    fake_scores = []
     gnn_evidence = []
     start_time = time.time()
     prompt_text = STRUCTURED_COT_PROMPT if opt.structured_cot else PROMPT_TEXT
@@ -268,8 +354,10 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
             print(f"[跳过] 找不到图像: {image_path}")
             results.append("error")
             text_results.append("error")
+            lm_fake_probs.append(np.nan)
             cot_reports.append("missing image")
             gnn_fake_probs.append(np.nan)
+            fake_scores.append(np.nan)
             gnn_evidence.append("")
             continue
 
@@ -284,12 +372,23 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
 
             # 执行推理
             with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    num_beams=3,
-                    do_sample=False
+                lm_prob_fake = lm_fake_probability(
+                    model=model,
+                    processor=processor,
+                    image=image,
+                    device=device,
+                    structured_cot=opt.structured_cot,
                 )
+                pred_text = ""
+                if opt.generate_reports or opt.decision_source == "generate":
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=3,
+                        do_sample=False
+                    )
+                    pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    pred_text = pred_text.replace(prompt_text, "").strip()
                 graph_prob_fake = np.nan
                 graph_label = None
                 evidence_text = ""
@@ -305,26 +404,39 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
                     evidence_text = evidence[0] if evidence else ""
 
             # 解码结果
-            pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            pred_text = pred_text.replace(prompt_text, "").strip()
-            text_label = extract_final_label(pred_text) if opt.structured_cot else map_text_to_binary(pred_text)
-            final_label = text_label
-            if graph_label is not None:
-                fused_score = opt.gnn_vote_weight * graph_prob_fake + (1.0 - opt.gnn_vote_weight) * float(text_label)
-                final_label = int(fused_score >= 0.5)
+            generated_label = None
+            if pred_text:
+                generated_label = extract_final_label(pred_text) if opt.structured_cot else map_text_to_binary(pred_text)
+
+            lm_label = int(lm_prob_fake >= opt.threshold)
+            text_label = generated_label if opt.decision_source == "generate" and generated_label is not None else lm_label
+
+            if opt.decision_source == "gnn" and graph_label is not None:
+                final_score = graph_prob_fake
+            elif opt.decision_source == "fusion" and graph_label is not None:
+                final_score = opt.gnn_vote_weight * graph_prob_fake + (1.0 - opt.gnn_vote_weight) * lm_prob_fake
+            elif opt.decision_source == "generate" and generated_label is not None:
+                final_score = float(generated_label)
+            else:
+                final_score = lm_prob_fake
+            final_label = int(final_score >= opt.threshold)
 
             results.append(label_to_text(final_label))
             text_results.append(label_to_text(text_label))
+            lm_fake_probs.append(lm_prob_fake)
             cot_reports.append(pred_text)
             gnn_fake_probs.append(graph_prob_fake)
+            fake_scores.append(final_score)
             gnn_evidence.append(evidence_text)
 
         except Exception as e:
             print(f"[错误] 图像 {image_path} 推理失败: {e}")
             results.append("error")
             text_results.append("error")
+            lm_fake_probs.append(np.nan)
             cot_reports.append(f"error: {e}")
             gnn_fake_probs.append(np.nan)
+            fake_scores.append(np.nan)
             gnn_evidence.append("")
 
     end_time = time.time()
@@ -337,7 +449,10 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
         "Tlabel": test_df["text"].apply(map_text_to_binary),
         "Pred": results,
         "TextPred": text_results,
+        "LMFakeProb": lm_fake_probs,
         "GNNFakeProb": gnn_fake_probs,
+        "FakeScore": fake_scores,
+        "DecisionSource": opt.decision_source,
         "GNNEvidence": gnn_evidence,
         "CoTReport": cot_reports,
         "Plabel": [map_text_to_binary(x) for x in results],
@@ -353,10 +468,14 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
         print(f"[警告] {dataset_name} 所有预测结果相同！请检查模型或数据。")
 
     # 计算指标
-    y_true, y_pred = result_df["Tlabel"], result_df["Plabel"]
+    y_true = result_df["Tlabel"].astype(int)
+    y_score = result_df["FakeScore"].astype(float).fillna(0.0)
+    y_pred = (y_score >= opt.threshold).astype(int)
+    result_df["Plabel"] = y_pred
+    result_df["Pred"] = result_df["Plabel"].apply(label_to_text)
     accuracy = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
-    fpr, tpr, _ = roc_curve(y_true, y_pred)
+    fpr, tpr, _ = roc_curve(y_true, y_score)
     auc_score = auc(fpr, tpr)
 
     print(f"\n=== {dataset_name} 指标 ===")
@@ -414,8 +533,16 @@ if __name__ == "__main__":
                         help="融合判决时 GNN fake 概率的权重，范围 0-1")
     parser.add_argument("--gnn_top_k", type=int, default=3,
                         help="保存 GNN 证据热区时保留的 top-k patch 数")
+    parser.add_argument("--decision_source", type=str, default="lm",
+                        choices=["lm", "gnn", "fusion", "generate"],
+                        help="Decision source: lm uses fake/real likelihood scoring; fusion blends LM and GNN.")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Fake probability threshold used for accuracy/F1.")
+    parser.add_argument("--generate_reports", action="store_true",
+                        help="Generate CoT text reports. Classification does not depend on generated text by default.")
     opt = parser.parse_args()
     opt.gnn_vote_weight = min(max(opt.gnn_vote_weight, 0.0), 1.0)
+    opt.threshold = min(max(opt.threshold, 0.0), 1.0)
 
     # ===========================
     # 模型加载
@@ -433,7 +560,7 @@ if __name__ == "__main__":
     model = PeftModel.from_pretrained(model, opt.model_path)
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=True)
+    processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=False)
     gnn_head = None
     if opt.gnn_head_path is not None:
         print(f"[INFO] 加载 GNN-CoT 头: {opt.gnn_head_path}")
