@@ -24,7 +24,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from transformers import AutoProcessor, Blip2ForConditionalGeneration
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model
 from gnn_cot import StructuredCoTReward, build_gnn_cot_head, save_gnn_cot_head
 
 
@@ -76,7 +76,15 @@ class FakeRealDataset(Dataset):
     训练时我们不在 __getitem__ 里做 tokenizer，
     而是在 collate_fn 里一次性处理一个 batch。
     """
-    def __init__(self, csv_path: str, feedback_col: str = None):
+    def __init__(
+        self,
+        csv_path: str,
+        feedback_col: str = None,
+        cot_target_col: str = None,
+        prompt_col: str = None,
+        path_prefix_from: str = None,
+        path_prefix_to: str = None,
+    ):
         super().__init__()
         self.df = pd.read_csv(csv_path)
         if "image" not in self.df.columns:
@@ -87,15 +95,24 @@ class FakeRealDataset(Dataset):
             raise ValueError(f"CSV 中缺少人类反馈列: {feedback_col}")
 
         # 保证 label 是 int
+        if cot_target_col is not None and cot_target_col not in self.df.columns:
+            raise ValueError(f"CSV is missing CoT target column: {cot_target_col}")
+        if prompt_col is not None and prompt_col not in self.df.columns:
+            raise ValueError(f"CSV is missing prompt column: {prompt_col}")
+
         self.df["label"] = self.df["label"].astype(int)
         self.feedback_col = feedback_col
+        self.cot_target_col = cot_target_col
+        self.prompt_col = prompt_col
+        self.path_prefix_from = path_prefix_from
+        self.path_prefix_to = path_prefix_to
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image_path = row["image"]
+        image_path = self._normalize_image_path(row["image"])
         label = int(row["label"])
 
         if not os.path.exists(image_path):
@@ -105,6 +122,8 @@ class FakeRealDataset(Dataset):
             "image_path": image_path,
             "label": label,
             "feedback_score": self._feedback_score(row),
+            "cot_target": self._optional_text(row, self.cot_target_col),
+            "prompt": self._optional_text(row, self.prompt_col),
         }
 
     def _feedback_score(self, row):
@@ -117,6 +136,23 @@ class FakeRealDataset(Dataset):
         if score > 1.0:
             score = score / 5.0 if score <= 5.0 else score / 100.0
         return float(min(max(score, 0.0), 1.0))
+
+    def _normalize_image_path(self, image_path):
+        image_path = str(image_path)
+        if self.path_prefix_from and self.path_prefix_to and image_path.startswith(self.path_prefix_from):
+            suffix = image_path[len(self.path_prefix_from):].lstrip("/\\")
+            image_path = os.path.join(self.path_prefix_to, suffix)
+        return image_path
+
+    @staticmethod
+    def _optional_text(row, column_name):
+        if column_name is None:
+            return None
+        value = row[column_name]
+        if pd.isna(value):
+            return None
+        value = str(value).strip()
+        return value if value else None
 
 
 # def collate_fn(batch, processor, device):
@@ -204,6 +240,13 @@ def _build_labels_for_targets(input_ids, attention_mask, target_texts, tokenizer
     return labels_ids
 
 
+def _ensure_target_separator(target_text):
+    target_text = str(target_text)
+    if target_text.startswith((" ", "\n", "\t")):
+        return target_text
+    return "\n" + target_text
+
+
 def collate_fn(batch, processor, use_cot=False):
     """
     只在 CPU 上做打包，不要在这里 .to(cuda)
@@ -215,11 +258,27 @@ def collate_fn(batch, processor, use_cot=False):
     images = [Image.open(p).convert("RGB") for p in image_paths]
     answers = ["fake" if l.item() == 1 else "real" for l in labels_01]
     if use_cot:
-        target_texts = ["\n" + COT_TEMPLATES[int(label.item())] for label in labels_01]
-        texts = [f"{COT_PROMPT_TEXT}{target_text}" for target_text in target_texts]
+        target_texts = []
+        prompts = []
+        for item, label in zip(batch, labels_01):
+            custom_target = item.get("cot_target")
+            if custom_target:
+                target_texts.append(_ensure_target_separator(custom_target))
+            else:
+                target_texts.append("\n" + COT_TEMPLATES[int(label.item())])
+            prompts.append(item.get("prompt") or COT_PROMPT_TEXT)
+        texts = [f"{prompt}{target_text}" for prompt, target_text in zip(prompts, target_texts)]
     else:
         target_texts = [f" {ans}" for ans in answers]
         texts = [f"{PROMPT_TEXT}{target_text}" for target_text in target_texts]
+
+    cls_target_texts = [f" {ans}" for ans in answers]
+    cls_texts = [f"{PROMPT_TEXT}{target_text}" for target_text in cls_target_texts]
+    cls_inputs = processor.tokenizer(
+        cls_texts,
+        return_tensors="pt",
+        padding=True,
+    )
 
     inputs = processor(
         images=images,
@@ -238,12 +297,21 @@ def collate_fn(batch, processor, use_cot=False):
         target_texts=target_texts,
         tokenizer=processor.tokenizer,
     )
+    cls_lm_labels = _build_labels_for_targets(
+        input_ids=cls_inputs["input_ids"],
+        attention_mask=cls_inputs["attention_mask"],
+        target_texts=cls_target_texts,
+        tokenizer=processor.tokenizer,
+    )
 
     batch_out = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "pixel_values": pixel_values,
         "labels": labels_ids,
+        "cls_input_ids": cls_inputs["input_ids"],
+        "cls_attention_mask": cls_inputs["attention_mask"],
+        "cls_lm_labels": cls_lm_labels,
         "cls_labels": labels_01,
         "feedback_scores": feedback_scores,
     }
@@ -272,13 +340,12 @@ def build_model_and_processor(base_model_path: str, lora_r: int, lora_alpha: int
         target_modules=["q_proj", "v_proj"],
         lora_dropout=lora_dropout,
         bias="none",
-        task_type=TaskType.CAUSAL_LM,
     )
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    processor = AutoProcessor.from_pretrained(base_model_path, use_fast=True)
+    processor = AutoProcessor.from_pretrained(base_model_path, use_fast=False)
 
     return model, processor
 
@@ -330,7 +397,14 @@ def train(opt):
     #     collate_fn=collate,
     #     pin_memory=True
     # )
-    dataset = FakeRealDataset(opt.dataset, feedback_col=opt.rlhf_feedback_col)
+    dataset = FakeRealDataset(
+        opt.dataset,
+        feedback_col=opt.rlhf_feedback_col,
+        cot_target_col=opt.cot_target_col,
+        prompt_col=opt.prompt_col,
+        path_prefix_from=opt.path_prefix_from,
+        path_prefix_to=opt.path_prefix_to,
+    )
     collate = lambda batch: collate_fn(batch, processor, use_cot=opt.use_cot or opt.use_gnn_cot)
     dataloader = DataLoader(
         dataset,
@@ -386,6 +460,9 @@ def train(opt):
             attention_mask = batch["attention_mask"].to(device)
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float16)
             labels = batch["labels"].to(device)
+            cls_input_ids = batch["cls_input_ids"].to(device)
+            cls_attention_mask = batch["cls_attention_mask"].to(device)
+            cls_lm_labels = batch["cls_lm_labels"].to(device)
             cls_labels = batch["cls_labels"].to(device)  # 如果之后要用的话
             feedback_scores = batch["feedback_scores"].to(device)
             outputs = model(
@@ -397,6 +474,16 @@ def train(opt):
 
             loss = outputs.loss
             postfix = {}
+            if opt.cls_loss_weight > 0:
+                cls_lm_outputs = model(
+                    input_ids=cls_input_ids,
+                    attention_mask=cls_attention_mask,
+                    pixel_values=pixel_values,
+                    labels=cls_lm_labels,
+                )
+                loss = loss + opt.cls_loss_weight * cls_lm_outputs.loss
+                postfix["cls_loss"] = f"{cls_lm_outputs.loss.item():.4f}"
+
             if gnn_head is not None:
                 graph_outputs = gnn_head(
                     pixel_values=pixel_values,
@@ -484,11 +571,21 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_workers", type=int, default=4)  #4
+    parser.add_argument("--cot_target_col", type=str, default=None,
+                        help="Optional CSV column containing the structured CoT target text for SFT.")
+    parser.add_argument("--prompt_col", type=str, default=None,
+                        help="Optional CSV column containing the prompt/instruction text.")
+    parser.add_argument("--path_prefix_from", type=str, default=None,
+                        help="Optional old image path prefix to replace when loading CSV rows.")
+    parser.add_argument("--path_prefix_to", type=str, default=None,
+                        help="Optional new image path prefix used with --path_prefix_from.")
 
     # LoRA 超参数（可以按需调整，和你之前脚本保持一致也行）
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--cls_loss_weight", type=float, default=0.0,
+                        help="Optional auxiliary fake/real short-answer LM loss weight.")
 
     # GNN-CoT research branch.
     parser.add_argument("--use_cot", action="store_true",
