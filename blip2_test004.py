@@ -23,6 +23,15 @@ python blip2_test004.py \
               ./data/Test_CSV/test_ProjectedGAN.csv \
     --num_samples 500
 
+python blip2_test004.py \
+  --base_model ./blip2-opt-2.7b \
+  --model_path ./SaveFineTune/LDM-gnn-cot_test/epoch020 \
+  --gnn_head_path ./SaveFineTune/LDM-gnn-cot_test/epoch020/gnn_cot_head.pt \
+  --dataset ./data/Test_CSV/test_LDM.csv \
+  --structured_cot \
+  --num_samples 500 \
+  --decision_source lm
+
 #自己训练--model_path    ./SaveFineTune/LDM-train-epochs03
 改63行
 和6的基础上运行时去掉字体提示
@@ -36,7 +45,6 @@ import matplotlib.pyplot as plt
 from dataset import ImageCaptioningDataset
 from torch.utils.data import DataLoader
 import torch
-import torch.nn.functional as F
 from transformers import AutoProcessor, Blip2ForConditionalGeneration
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, roc_curve, auc
 from peft import PeftModel
@@ -73,7 +81,7 @@ if torch.cuda.is_available():
 # ===========================
 # 定义目标保存目录（核心修改点1）
 # ===========================
-TARGET_SAVE_DIR = "./Test-Results/GAN/In_PNDM_Results/aligned-sample500-00020-In_PNDM_Results"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
+TARGET_SAVE_DIR = "./Test-Results/gnn-cot_test/gnn-cot_test-20_500_lm"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
 # 确保目标目录存在，不存在则创建
 os.makedirs(TARGET_SAVE_DIR, exist_ok=True)
 
@@ -184,36 +192,138 @@ def class_targets_for_scoring(structured_cot):
     return [" real", " fake"]
 
 
-def lm_fake_probability(model, processor, image, device, structured_cot):
-    prompt = STRUCTURED_COT_PROMPT if structured_cot else PROMPT_TEXT
-    target_texts = class_targets_for_scoring(structured_cot)
-    texts = [prompt + target_text for target_text in target_texts]
-    inputs = processor(images=[image, image], text=texts, return_tensors="pt", padding=True)
-    labels = build_labels_for_targets(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        target_texts=target_texts,
-        tokenizer=processor.tokenizer,
-    ).to(device)
-    inputs = move_inputs_to_device(inputs, device)
+def lm_fake_probability(model, processor, image, device, score_mode):
+    use_cot_score = score_mode == "cot"
+    prompt = STRUCTURED_COT_PROMPT if use_cot_score else PROMPT_TEXT
+    target_texts = class_targets_for_scoring(use_cot_score)
+    losses = []
+    for target_text in target_texts:
+        text = prompt + target_text
+        inputs = processor(images=image, text=text, return_tensors="pt")
+        labels = build_labels_for_targets(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            target_texts=[target_text],
+            tokenizer=processor.tokenizer,
+        )
+        inputs = move_inputs_to_device(inputs, device)
+        labels = labels.to(device)
 
-    outputs = model(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        pixel_values=inputs["pixel_values"],
-    )
-    shift_logits = outputs.logits[:, :-1, :].contiguous().float()
-    shift_labels = labels[:, 1:].contiguous()
-    token_loss = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.shape[-1]),
-        shift_labels.reshape(-1),
-        ignore_index=-100,
-        reduction="none",
-    ).view(shift_labels.shape)
-    label_mask = shift_labels.ne(-100)
-    nll = (token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp_min(1)
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pixel_values=inputs["pixel_values"],
+            labels=labels,
+        )
+        losses.append(outputs.loss.detach().float())
+
+    nll = torch.stack(losses)
     probs = torch.softmax(-nll, dim=0)
     return probs[1].item()
+
+
+def resolve_lora_checkpoint(model_path):
+    if os.path.isfile(os.path.join(model_path, "adapter_config.json")):
+        return model_path
+
+    if os.path.isdir(model_path):
+        epoch_dirs = []
+        for name in os.listdir(model_path):
+            candidate = os.path.join(model_path, name)
+            if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "adapter_config.json")):
+                epoch_dirs.append(candidate)
+        if epoch_dirs:
+            return sorted(epoch_dirs)[-1]
+
+    search_root = model_path
+    while search_root and not os.path.isdir(search_root):
+        parent = os.path.dirname(search_root)
+        if parent == search_root:
+            break
+        search_root = parent
+
+    nearby = []
+    if search_root and os.path.isdir(search_root):
+        for root, _, files in os.walk(search_root):
+            if "adapter_config.json" in files:
+                nearby.append(root)
+                if len(nearby) >= 10:
+                    break
+
+    message = f"Cannot find adapter_config.json at {model_path}."
+    if nearby:
+        message += "\nAvailable LoRA checkpoints nearby:\n" + "\n".join(f"  - {path}" for path in nearby)
+    raise FileNotFoundError(message)
+
+
+def resolve_gnn_head_path(gnn_head_path, model_path):
+    if gnn_head_path is None:
+        candidate = os.path.join(model_path, "gnn_cot_head.pt")
+        return candidate if os.path.isfile(candidate) else None
+    if os.path.isfile(gnn_head_path):
+        return gnn_head_path
+    fallback = os.path.join(model_path, "gnn_cot_head.pt")
+    if os.path.isfile(fallback):
+        return fallback
+    raise FileNotFoundError(f"Cannot find GNN head at {gnn_head_path} or {fallback}.")
+
+
+def _metric_value(y_true, y_pred, metric_name):
+    if metric_name == "accuracy":
+        return accuracy_score(y_true, y_pred)
+    return f1_score(y_true, y_pred)
+
+
+def find_best_threshold(y_true, y_score, metric_name="f1"):
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    valid = np.isfinite(y_score)
+    y_true = y_true[valid]
+    y_score = y_score[valid]
+    if y_score.size == 0:
+        return 0.5, 0.0
+
+    unique_scores = np.unique(y_score)
+    candidates = [float(unique_scores[0]) - 1e-12, float(unique_scores[-1]) + 1e-12]
+    candidates.extend(float(score) for score in unique_scores)
+    if unique_scores.size > 1:
+        mids = (unique_scores[:-1] + unique_scores[1:]) / 2.0
+        candidates.extend(float(score) for score in mids)
+
+    best_threshold = 0.5
+    best_metric = -1.0
+    for threshold in candidates:
+        y_pred = (y_score >= threshold).astype(int)
+        metric = _metric_value(y_true, y_pred, metric_name)
+        if metric > best_metric:
+            best_metric = metric
+            best_threshold = threshold
+    return best_threshold, best_metric
+
+
+def find_best_fusion_weight(y_true, lm_score, gnn_score):
+    y_true = np.asarray(y_true, dtype=int)
+    lm_score = np.asarray(lm_score, dtype=float)
+    gnn_score = np.asarray(gnn_score, dtype=float)
+    valid = np.isfinite(lm_score) & np.isfinite(gnn_score)
+    if not valid.any():
+        return 0.0, lm_score
+
+    best_weight = 0.0
+    best_auc = -1.0
+    best_score = lm_score
+    for weight in np.linspace(0.0, 1.0, 21):
+        score = (1.0 - weight) * lm_score + weight * gnn_score
+        try:
+            fpr, tpr, _ = roc_curve(y_true[valid], score[valid])
+            auc_score = auc(fpr, tpr)
+        except ValueError:
+            auc_score = -1.0
+        if auc_score > best_auc:
+            best_auc = auc_score
+            best_weight = float(weight)
+            best_score = score
+    return best_weight, best_score
 
 
 # def plot_single_roc(y_true, y_pred, dataset_name, save_path):
@@ -377,7 +487,7 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
                     processor=processor,
                     image=image,
                     device=device,
-                    structured_cot=opt.structured_cot,
+                    score_mode=opt.score_mode,
                 )
                 pred_text = ""
                 if opt.generate_reports or opt.decision_source == "generate":
@@ -455,8 +565,30 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
         "DecisionSource": opt.decision_source,
         "GNNEvidence": gnn_evidence,
         "CoTReport": cot_reports,
-        "Plabel": [map_text_to_binary(x) for x in results],
     })
+
+    y_true = result_df["Tlabel"].astype(int)
+    y_score = result_df["FakeScore"].astype(float).fillna(0.0)
+
+    applied_fusion_weight = opt.gnn_vote_weight
+    if opt.auto_fusion_weight:
+        lm_score = result_df["LMFakeProb"].astype(float).to_numpy()
+        gnn_score = result_df["GNNFakeProb"].astype(float).to_numpy()
+        applied_fusion_weight, fused_score = find_best_fusion_weight(y_true, lm_score, gnn_score)
+        y_score = pd.Series(fused_score, index=result_df.index).fillna(0.0)
+        result_df["FakeScore"] = y_score
+        result_df["DecisionSource"] = f"auto_fusion:{applied_fusion_weight:.2f}"
+
+    applied_threshold = opt.threshold
+    if opt.auto_threshold:
+        applied_threshold, best_metric = find_best_threshold(y_true, y_score, opt.threshold_metric)
+        print(f"[INFO] 自动阈值({opt.threshold_metric})={applied_threshold:.12f}, best={best_metric:.4f}")
+
+    y_pred = (y_score >= applied_threshold).astype(int)
+    result_df["Plabel"] = y_pred
+    result_df["Pred"] = result_df["Plabel"].apply(label_to_text)
+    result_df["AppliedThreshold"] = applied_threshold
+    result_df["AppliedFusionWeight"] = applied_fusion_weight
 
     # 打印预测分布
     print(f"\n[INFO] {dataset_name} 预测分布:")
@@ -468,11 +600,6 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
         print(f"[警告] {dataset_name} 所有预测结果相同！请检查模型或数据。")
 
     # 计算指标
-    y_true = result_df["Tlabel"].astype(int)
-    y_score = result_df["FakeScore"].astype(float).fillna(0.0)
-    y_pred = (y_score >= opt.threshold).astype(int)
-    result_df["Plabel"] = y_pred
-    result_df["Pred"] = result_df["Plabel"].apply(label_to_text)
     accuracy = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
     fpr, tpr, _ = roc_curve(y_true, y_score)
@@ -491,7 +618,7 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
 
     # 绘制并保存单个ROC曲线（核心修改点3：改为目标目录）
     roc_save_path = os.path.join(TARGET_SAVE_DIR, f"roc_{dataset_name}.png")
-    fpr, tpr, auc_score = plot_single_roc(y_true, y_pred, dataset_name, roc_save_path)
+    fpr, tpr, auc_score = plot_single_roc(y_true, y_score, dataset_name, roc_save_path)
     print(f"[INFO] ROC曲线已保存至 {roc_save_path}")
 
     return {
@@ -536,8 +663,16 @@ if __name__ == "__main__":
     parser.add_argument("--decision_source", type=str, default="lm",
                         choices=["lm", "gnn", "fusion", "generate"],
                         help="Decision source: lm uses fake/real likelihood scoring; fusion blends LM and GNN.")
+    parser.add_argument("--score_mode", type=str, default="short", choices=["short", "cot"],
+                        help="LM scoring target. short uses real/fake answers; cot scores full CoT templates.")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Fake probability threshold used for accuracy/F1.")
+    parser.add_argument("--auto_threshold", action="store_true",
+                        help="Sweep thresholds on the evaluated data and apply the best one.")
+    parser.add_argument("--threshold_metric", type=str, default="f1", choices=["f1", "accuracy"],
+                        help="Metric used by --auto_threshold.")
+    parser.add_argument("--auto_fusion_weight", action="store_true",
+                        help="Sweep LM/GNN fusion weights by AUC when both scores are available.")
     parser.add_argument("--generate_reports", action="store_true",
                         help="Generate CoT text reports. Classification does not depend on generated text by default.")
     opt = parser.parse_args()
@@ -556,12 +691,14 @@ if __name__ == "__main__":
         torch_dtype=torch.float16
     )
 
+    opt.model_path = resolve_lora_checkpoint(opt.model_path)
     print(f"[INFO] 加载微调LoRA权重: {opt.model_path}")
     model = PeftModel.from_pretrained(model, opt.model_path)
     model.eval()
 
     processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=False)
     gnn_head = None
+    opt.gnn_head_path = resolve_gnn_head_path(opt.gnn_head_path, opt.model_path)
     if opt.gnn_head_path is not None:
         print(f"[INFO] 加载 GNN-CoT 头: {opt.gnn_head_path}")
         gnn_head = load_gnn_cot_head(opt.gnn_head_path, processor.tokenizer, map_location=device).to(device)
