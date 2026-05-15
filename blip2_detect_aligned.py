@@ -10,22 +10,12 @@ python blip2_detect_aligned.py \
     --batch_size 32 \
     --save_path ./SaveFineTune/LDM-train-aligned--epochs0020
 
-python blip2_detect_aligned.py \
-  --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
-  --base_model ./blip2-opt-2.7b \
-  --epochs 20 \
-  --batch_size 24 \
-  --num_workers 0 \
-  --save_path ./SaveFineTune/LDM-gnn-cot_test \
-  --use_gnn_cot \
-  --use_cot \
-  --cls_loss_weight 1.0
-
 """
 
 import os
 import argparse
 import time
+import math
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -34,7 +24,7 @@ import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
 
-from transformers import AutoProcessor, Blip2ForConditionalGeneration
+from transformers import AutoProcessor, Blip2ForConditionalGeneration, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 from gnn_cot import StructuredCoTReward, build_gnn_cot_head, save_gnn_cot_head
 
@@ -335,8 +325,15 @@ def collate_fn(batch, processor, use_cot=False):
 # -----------------------
 # 构造 LoRA 模型
 # -----------------------
+def _parse_lora_target_modules(module_text: str):
+    modules = [name.strip() for name in str(module_text).split(",") if name.strip()]
+    if not modules:
+        raise ValueError("--lora_target_modules must contain at least one module name")
+    return modules
+
+
 def build_model_and_processor(base_model_path: str, lora_r: int, lora_alpha: int,
-                              lora_dropout: float, device: str):
+                              lora_dropout: float, device: str, lora_target_modules: str):
     print(f"[INFO] 加载基础模型: {base_model_path}")
     model = Blip2ForConditionalGeneration.from_pretrained(
         base_model_path,
@@ -345,10 +342,13 @@ def build_model_and_processor(base_model_path: str, lora_r: int, lora_alpha: int
     )
 
     # LoRA 配置：常见选择是对 q_proj / v_proj 打 LoRA
+    target_modules = _parse_lora_target_modules(lora_target_modules)
+    print(f"[INFO] LoRA target modules: {target_modules}")
+
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias="none",
     )
@@ -375,6 +375,7 @@ def train(opt):
         opt.lora_alpha,
         opt.lora_dropout,
         device,
+        opt.lora_target_modules,
     )
     gnn_head = None
     cot_reward = None
@@ -592,9 +593,11 @@ def parse_args():
                         help="Optional new image path prefix used with --path_prefix_from.")
 
     # LoRA 超参数（可以按需调整，和你之前脚本保持一致也行）
-    parser.add_argument("--lora_r", type=int, default=32)  #16
-    parser.add_argument("--lora_alpha", type=int, default=64)   #32
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_target_modules", type=str, default="q_proj,v_proj",
+                        help="Comma-separated LoRA target module names, for example q_proj,k_proj,v_proj,out_proj.")
     parser.add_argument("--cls_loss_weight", type=float, default=0.5,
                         help="Optional auxiliary fake/real short-answer LM loss weight.")
 
