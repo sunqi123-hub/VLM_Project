@@ -14,7 +14,7 @@ python blip2_detect_aligned.py \
   --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
   --base_model ./blip2-opt-2.7b \
   --epochs 20 \
-  --batch_size 8 \
+  --batch_size 24 \
   --num_workers 0 \
   --save_path ./SaveFineTune/LDM-gnn-cot_test \
   --use_gnn_cot \
@@ -592,8 +592,8 @@ def parse_args():
                         help="Optional new image path prefix used with --path_prefix_from.")
 
     # LoRA 超参数（可以按需调整，和你之前脚本保持一致也行）
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_r", type=int, default=32)  #16
+    parser.add_argument("--lora_alpha", type=int, default=64)   #32
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--cls_loss_weight", type=float, default=0.5,
                         help="Optional auxiliary fake/real short-answer LM loss weight.")
