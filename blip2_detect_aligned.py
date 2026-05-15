@@ -15,7 +15,6 @@ python blip2_detect_aligned.py \
 import os
 import argparse
 import time
-import math
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -24,37 +23,14 @@ import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
 
-from transformers import AutoProcessor, Blip2ForConditionalGeneration, get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model
-from gnn_cot import StructuredCoTReward, build_gnn_cot_head, save_gnn_cot_head
+from transformers import AutoProcessor, Blip2ForConditionalGeneration
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 # -----------------------
 # 一些固定设置
 # -----------------------
 PROMPT_TEXT = "Is this image fake or real? Answer ONLY with 'fake' or 'real'(no extra words)."
-COT_PROMPT_TEXT = (
-    "You are a forensic image analyst. Decide whether the image is fake or real. "
-    "Return exactly four lines with these fields: Quick intuition, Salient evidence, "
-    "Deep reasoning, Final conclusion."
-)
-
-COT_TEMPLATES = {
-    0: (
-        "Quick intuition: real.\n"
-        "Salient evidence: no localized manipulation cue is dominant in the visible regions.\n"
-        "Deep reasoning: the spatial content and frequency texture are mutually consistent, "
-        "so the forensic evidence supports an authentic image.\n"
-        "Final conclusion: real."
-    ),
-    1: (
-        "Quick intuition: fake.\n"
-        "Salient evidence: localized visual artifacts and frequency inconsistency are suspicious.\n"
-        "Deep reasoning: the spatial content and frequency texture are not fully aligned, "
-        "so the forensic evidence supports a synthetic or manipulated image.\n"
-        "Final conclusion: fake."
-    ),
-}
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -77,43 +53,23 @@ class FakeRealDataset(Dataset):
     训练时我们不在 __getitem__ 里做 tokenizer，
     而是在 collate_fn 里一次性处理一个 batch。
     """
-    def __init__(
-        self,
-        csv_path: str,
-        feedback_col: str = None,
-        cot_target_col: str = None,
-        prompt_col: str = None,
-        path_prefix_from: str = None,
-        path_prefix_to: str = None,
-    ):
+    def __init__(self, csv_path: str):
         super().__init__()
         self.df = pd.read_csv(csv_path)
         if "image" not in self.df.columns:
             raise ValueError("CSV 中缺少 'image' 列")
         if "label" not in self.df.columns:
             raise ValueError("CSV 中缺少 'label' 列 (0/1)")
-        if feedback_col is not None and feedback_col not in self.df.columns:
-            raise ValueError(f"CSV 中缺少人类反馈列: {feedback_col}")
 
         # 保证 label 是 int
-        if cot_target_col is not None and cot_target_col not in self.df.columns:
-            raise ValueError(f"CSV is missing CoT target column: {cot_target_col}")
-        if prompt_col is not None and prompt_col not in self.df.columns:
-            raise ValueError(f"CSV is missing prompt column: {prompt_col}")
-
         self.df["label"] = self.df["label"].astype(int)
-        self.feedback_col = feedback_col
-        self.cot_target_col = cot_target_col
-        self.prompt_col = prompt_col
-        self.path_prefix_from = path_prefix_from
-        self.path_prefix_to = path_prefix_to
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image_path = self._normalize_image_path(row["image"])
+        image_path = row["image"]
         label = int(row["label"])
 
         if not os.path.exists(image_path):
@@ -122,38 +78,7 @@ class FakeRealDataset(Dataset):
         return {
             "image_path": image_path,
             "label": label,
-            "feedback_score": self._feedback_score(row),
-            "cot_target": self._optional_text(row, self.cot_target_col),
-            "prompt": self._optional_text(row, self.prompt_col),
         }
-
-    def _feedback_score(self, row):
-        if self.feedback_col is None:
-            return 1.0
-        value = row[self.feedback_col]
-        if pd.isna(value):
-            return 1.0
-        score = float(value)
-        if score > 1.0:
-            score = score / 5.0 if score <= 5.0 else score / 100.0
-        return float(min(max(score, 0.0), 1.0))
-
-    def _normalize_image_path(self, image_path):
-        image_path = str(image_path)
-        if self.path_prefix_from and self.path_prefix_to and image_path.startswith(self.path_prefix_from):
-            suffix = image_path[len(self.path_prefix_from):].lstrip("/\\")
-            image_path = os.path.join(self.path_prefix_to, suffix)
-        return image_path
-
-    @staticmethod
-    def _optional_text(row, column_name):
-        if column_name is None:
-            return None
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-        value = str(value).strip()
-        return value if value else None
 
 
 # def collate_fn(batch, processor, device):
@@ -212,74 +137,16 @@ class FakeRealDataset(Dataset):
 #         "cls_labels": labels_01.to(device),
 #     }
 #     return batch_out
-def _find_subsequence(sequence, pattern):
-    if len(pattern) == 0 or len(pattern) > len(sequence):
-        return None
-    last_start = len(sequence) - len(pattern)
-    for start in range(last_start + 1):
-        if sequence[start : start + len(pattern)] == pattern:
-            return start
-    return None
-
-
-def _build_labels_for_targets(input_ids, attention_mask, target_texts, tokenizer):
-    labels_ids = torch.full_like(input_ids, fill_value=-100)
-    for row_idx, target_text in enumerate(target_texts):
-        target_ids = tokenizer(target_text, add_special_tokens=False).input_ids
-        valid_positions = attention_mask[row_idx].nonzero(as_tuple=False).flatten()
-        sequence_len = int(valid_positions.numel())
-        target_len = min(len(target_ids), sequence_len)
-        if target_len == 0:
-            continue
-        valid_token_ids = input_ids[row_idx, valid_positions].tolist()
-        match_start = _find_subsequence(valid_token_ids, target_ids[:target_len])
-        if match_start is not None:
-            target_positions = valid_positions[match_start : match_start + target_len]
-        else:
-            target_positions = valid_positions[-target_len:]
-        labels_ids[row_idx, target_positions] = input_ids[row_idx, target_positions]
-    return labels_ids
-
-
-def _ensure_target_separator(target_text):
-    target_text = str(target_text)
-    if target_text.startswith((" ", "\n", "\t")):
-        return target_text
-    return "\n" + target_text
-
-
-def collate_fn(batch, processor, use_cot=False):
+def collate_fn(batch, processor):
     """
     只在 CPU 上做打包，不要在这里 .to(cuda)
     """
     image_paths = [item["image_path"] for item in batch]
     labels_01 = torch.tensor([item["label"] for item in batch], dtype=torch.long)
-    feedback_scores = torch.tensor([item.get("feedback_score", 1.0) for item in batch], dtype=torch.float)
 
     images = [Image.open(p).convert("RGB") for p in image_paths]
     answers = ["fake" if l.item() == 1 else "real" for l in labels_01]
-    if use_cot:
-        target_texts = []
-        prompts = []
-        for item, label in zip(batch, labels_01):
-            custom_target = item.get("cot_target")
-            if custom_target:
-                target_texts.append(_ensure_target_separator(custom_target))
-            else:
-                target_texts.append("\n" + COT_TEMPLATES[int(label.item())])
-            prompts.append(item.get("prompt") or COT_PROMPT_TEXT)
-        texts = [f"{prompt}{target_text}" for prompt, target_text in zip(prompts, target_texts)]
-    else:
-        target_texts = [f" {ans}" for ans in answers]
-        texts = [f"{PROMPT_TEXT}{target_text}" for target_text in target_texts]
-
-    cls_target_texts = [f" {ans}" for ans in answers]
-    cls_texts = [f"{PROMPT_TEXT}{target_text}" for target_text in cls_target_texts]
-    cls_inputs = processor.tokenizer(
-        cls_texts,
-        return_tensors="pt",
-        padding=True,
-    )
+    texts = [f"{PROMPT_TEXT} {ans}" for ans in answers]
 
     inputs = processor(
         images=images,
@@ -292,29 +159,21 @@ def collate_fn(batch, processor, use_cot=False):
     attention_mask = inputs["attention_mask"]
     pixel_values = inputs["pixel_values"]
 
-    labels_ids = _build_labels_for_targets(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        target_texts=target_texts,
-        tokenizer=processor.tokenizer,
-    )
-    cls_lm_labels = _build_labels_for_targets(
-        input_ids=cls_inputs["input_ids"],
-        attention_mask=cls_inputs["attention_mask"],
-        target_texts=cls_target_texts,
-        tokenizer=processor.tokenizer,
-    )
+    labels_ids = torch.full_like(input_ids, fill_value=-100)
+    answer_tokens = processor.tokenizer(
+        answers,
+        return_tensors="pt",
+        padding=True
+    ).input_ids
+    ans_len = answer_tokens.shape[1]
+    labels_ids[:, -ans_len:] = answer_tokens
 
     batch_out = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "pixel_values": pixel_values,
         "labels": labels_ids,
-        "cls_input_ids": cls_inputs["input_ids"],
-        "cls_attention_mask": cls_inputs["attention_mask"],
-        "cls_lm_labels": cls_lm_labels,
         "cls_labels": labels_01,
-        "feedback_scores": feedback_scores,
     }
     return batch_out
 
@@ -325,15 +184,8 @@ def collate_fn(batch, processor, use_cot=False):
 # -----------------------
 # 构造 LoRA 模型
 # -----------------------
-def _parse_lora_target_modules(module_text: str):
-    modules = [name.strip() for name in str(module_text).split(",") if name.strip()]
-    if not modules:
-        raise ValueError("--lora_target_modules must contain at least one module name")
-    return modules
-
-
 def build_model_and_processor(base_model_path: str, lora_r: int, lora_alpha: int,
-                              lora_dropout: float, device: str, lora_target_modules: str):
+                              lora_dropout: float, device: str):
     print(f"[INFO] 加载基础模型: {base_model_path}")
     model = Blip2ForConditionalGeneration.from_pretrained(
         base_model_path,
@@ -342,21 +194,19 @@ def build_model_and_processor(base_model_path: str, lora_r: int, lora_alpha: int
     )
 
     # LoRA 配置：常见选择是对 q_proj / v_proj 打 LoRA
-    target_modules = _parse_lora_target_modules(lora_target_modules)
-    print(f"[INFO] LoRA target modules: {target_modules}")
-
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=target_modules,
+        target_modules=["q_proj", "v_proj"],
         lora_dropout=lora_dropout,
         bias="none",
+        task_type=TaskType.CAUSAL_LM,
     )
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    processor = AutoProcessor.from_pretrained(base_model_path, use_fast=False)
+    processor = AutoProcessor.from_pretrained(base_model_path, use_fast=True)
 
     return model, processor
 
@@ -375,28 +225,7 @@ def train(opt):
         opt.lora_alpha,
         opt.lora_dropout,
         device,
-        opt.lora_target_modules,
     )
-    gnn_head = None
-    cot_reward = None
-    if opt.use_gnn_cot:
-        print("[INFO] 启用 GNN-CoT 分支: image/text heterogeneous graph + structured reward")
-        gnn_head = build_gnn_cot_head(
-            tokenizer=processor.tokenizer,
-            hidden_dim=opt.gnn_hidden_dim,
-            text_max_nodes=opt.gnn_text_nodes,
-            image_grid_size=opt.gnn_grid_size,
-            num_layers=opt.gnn_layers,
-            num_heads=opt.gnn_heads,
-            dropout=opt.gnn_dropout,
-        ).to(device)
-        cot_reward = StructuredCoTReward(
-            tokenizer=processor.tokenizer,
-            final_weight=opt.rlhf_final_weight,
-            structure_weight=opt.rlhf_structure_weight,
-            alignment_weight=opt.rlhf_alignment_weight,
-            feedback_weight=opt.rlhf_feedback_weight,
-        )
 
     # 2. 数据
     # dataset = FakeRealDataset(opt.dataset)
@@ -409,15 +238,8 @@ def train(opt):
     #     collate_fn=collate,
     #     pin_memory=True
     # )
-    dataset = FakeRealDataset(
-        opt.dataset,
-        feedback_col=opt.rlhf_feedback_col,
-        cot_target_col=opt.cot_target_col,
-        prompt_col=opt.prompt_col,
-        path_prefix_from=opt.path_prefix_from,
-        path_prefix_to=opt.path_prefix_to,
-    )
-    collate = lambda batch: collate_fn(batch, processor, use_cot=opt.use_cot or opt.use_gnn_cot)
+    dataset = FakeRealDataset(opt.dataset)
+    collate = lambda batch: collate_fn(batch, processor)
     dataloader = DataLoader(
         dataset,
         batch_size=opt.batch_size,
@@ -428,24 +250,19 @@ def train(opt):
     )
 
     # 3. 优化器
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if gnn_head is not None:
-        trainable_params.extend(list(gnn_head.parameters()))
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        model.parameters(),
         lr=opt.lr,
         weight_decay=opt.weight_decay
     )
 
     model.train()
-    if gnn_head is not None:
-        gnn_head.train()
 
     os.makedirs(opt.save_path, exist_ok=True)
 
     print(f"[INFO] 数据集大小: {len(dataset)} 样本, batch_size={opt.batch_size}, "
           f"每个 epoch {len(dataloader)} 个 step")
-    print(f"[INFO] 训练 prompt: \"{COT_PROMPT_TEXT if (opt.use_cot or opt.use_gnn_cot) else PROMPT_TEXT}\"")
+    print(f"[INFO] 训练 prompt: \"{PROMPT_TEXT}\"")
 
     # 4. 训练循环
     for epoch in range(opt.epochs):
@@ -472,11 +289,7 @@ def train(opt):
             attention_mask = batch["attention_mask"].to(device)
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float16)
             labels = batch["labels"].to(device)
-            cls_input_ids = batch["cls_input_ids"].to(device)
-            cls_attention_mask = batch["cls_attention_mask"].to(device)
-            cls_lm_labels = batch["cls_lm_labels"].to(device)
             cls_labels = batch["cls_labels"].to(device)  # 如果之后要用的话
-            feedback_scores = batch["feedback_scores"].to(device)
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -484,43 +297,8 @@ def train(opt):
                 labels=labels,
             )
 
+
             loss = outputs.loss
-            postfix = {}
-            if opt.cls_loss_weight > 0:
-                cls_lm_outputs = model(
-                    input_ids=cls_input_ids,
-                    attention_mask=cls_attention_mask,
-                    pixel_values=pixel_values,
-                    labels=cls_lm_labels,
-                )
-                loss = loss + opt.cls_loss_weight * cls_lm_outputs.loss
-                postfix["cls_loss"] = f"{cls_lm_outputs.loss.item():.4f}"
-
-            if gnn_head is not None:
-                graph_outputs = gnn_head(
-                    pixel_values=pixel_values,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    cls_labels=cls_labels,
-                )
-                graph_loss = graph_outputs["loss"]
-                loss = loss + opt.gnn_loss_weight * graph_loss
-                postfix["graph_loss"] = f"{graph_loss.item():.4f}"
-                postfix["graph_acc"] = f"{graph_outputs['accuracy'].item():.3f}"
-
-                if cot_reward is not None and opt.rlhf_reward_weight > 0:
-                    reward_outputs = cot_reward(
-                        lm_logits=outputs.logits,
-                        labels=labels,
-                        graph_logits=graph_outputs["logits"],
-                        cls_labels=cls_labels,
-                        feedback_scores=feedback_scores if opt.rlhf_feedback_col is not None else None,
-                    )
-                    loss = loss + opt.rlhf_reward_weight * reward_outputs["loss"]
-                    postfix["reward"] = f"{reward_outputs['reward'].item():.3f}"
-                    if reward_outputs["feedback_reward"] is not None:
-                        postfix["human_fb"] = f"{reward_outputs['feedback_reward'].item():.3f}"
-
             loss_val = loss.item()
             epoch_loss += loss_val
 
@@ -534,8 +312,7 @@ def train(opt):
             progress_bar.set_postfix({
                 "step_loss": f"{loss_val:.4f}",
                 "avg_loss": f"{avg_loss:.4f}",
-                "imgs": f"{min(seen_imgs, len(dataset))}/{len(dataset)}",
-                **postfix,
+                "imgs": f"{min(seen_imgs, len(dataset))}/{len(dataset)}"
             })
 
         epoch_time = time.time() - start_time
@@ -548,10 +325,6 @@ def train(opt):
         os.makedirs(save_dir_epoch, exist_ok=True)
         print(f"[INFO] 保存 LoRA 权重到: {save_dir_epoch}")
         model.save_pretrained(save_dir_epoch)
-        if gnn_head is not None:
-            gnn_save_path = os.path.join(save_dir_epoch, "gnn_cot_head.pt")
-            save_gnn_cot_head(gnn_head, gnn_save_path)
-            print(f"[INFO] 保存 GNN-CoT 头到: {gnn_save_path}")
 
     print("[INFO] 训练完成！最终权重保存在目录:", opt.save_path)
 
@@ -583,46 +356,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_workers", type=int, default=4)  #4
-    parser.add_argument("--cot_target_col", type=str, default=None,
-                        help="Optional CSV column containing the structured CoT target text for SFT.")
-    parser.add_argument("--prompt_col", type=str, default=None,
-                        help="Optional CSV column containing the prompt/instruction text.")
-    parser.add_argument("--path_prefix_from", type=str, default=None,
-                        help="Optional old image path prefix to replace when loading CSV rows.")
-    parser.add_argument("--path_prefix_to", type=str, default=None,
-                        help="Optional new image path prefix used with --path_prefix_from.")
 
     # LoRA 超参数（可以按需调整，和你之前脚本保持一致也行）
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--lora_target_modules", type=str, default="q_proj,v_proj",
-                        help="Comma-separated LoRA target module names, for example q_proj,k_proj,v_proj,out_proj.")
-    parser.add_argument("--cls_loss_weight", type=float, default=0.5,
-                        help="Optional auxiliary fake/real short-answer LM loss weight.")
-
-    # GNN-CoT research branch.
-    parser.add_argument("--use_cot", action="store_true",
-                        help="将训练目标从单词答案改为结构化四步 CoT 报告")
-    parser.add_argument("--use_gnn_cot", action="store_true",
-                        help="启用视觉-文本异构图融合头，并自动使用结构化 CoT 训练目标")
-    parser.add_argument("--gnn_hidden_dim", type=int, default=256)
-    parser.add_argument("--gnn_text_nodes", type=int, default=24)
-    parser.add_argument("--gnn_grid_size", type=int, default=4)
-    parser.add_argument("--gnn_layers", type=int, default=2)
-    parser.add_argument("--gnn_heads", type=int, default=4)
-    parser.add_argument("--gnn_dropout", type=float, default=0.1)
-    parser.add_argument("--gnn_loss_weight", type=float, default=0.3)
-
-    # Differentiable RLHF-style reward proxy.
-    parser.add_argument("--rlhf_reward_weight", type=float, default=0.05)
-    parser.add_argument("--rlhf_final_weight", type=float, default=0.4)
-    parser.add_argument("--rlhf_structure_weight", type=float, default=0.3)
-    parser.add_argument("--rlhf_alignment_weight", type=float, default=0.3)
-    parser.add_argument("--rlhf_feedback_col", type=str, default=None,
-                        help="可选：CSV 中的人类反馈分数列，支持 0-1、1-5 或 0-100")
-    parser.add_argument("--rlhf_feedback_weight", type=float, default=0.5,
-                        help="人类反馈分数参与 RLHF-style 奖励加权的强度")
 
     return parser.parse_args()
 
