@@ -81,7 +81,7 @@ if torch.cuda.is_available():
 # ===========================
 # 定义目标保存目录（核心修改点1）
 # ===========================
-TARGET_SAVE_DIR = "./Test-Results/gnn-cot_test/gnn-cot_test-20_500_lm"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
+TARGET_SAVE_DIR = "./Test-Results/gnn-cot_test/gnn-cot_test02-20_500_fusion"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
 # 确保目标目录存在，不存在则创建
 os.makedirs(TARGET_SAVE_DIR, exist_ok=True)
 
