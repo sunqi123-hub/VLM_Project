@@ -23,15 +23,6 @@ python blip2_test004.py \
               ./data/Test_CSV/test_ProjectedGAN.csv \
     --num_samples 500
 
-python blip2_test004.py \
-  --base_model ./blip2-opt-2.7b \
-  --model_path ./SaveFineTune/LDM-gnn-cot_test/epoch020 \
-  --gnn_head_path ./SaveFineTune/LDM-gnn-cot_test/epoch020/gnn_cot_head.pt \
-  --dataset ./data/Test_CSV/test_LDM.csv \
-  --structured_cot \
-  --num_samples 500 \
-  --decision_source lm
-
 #自己训练--model_path    ./SaveFineTune/LDM-train-epochs03
 改63行
 和6的基础上运行时去掉字体提示
@@ -78,14 +69,14 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = False
 
 
-# ===========================
-# 定义目标保存目录（核心修改点1）
-# ===========================
-TARGET_SAVE_DIR = "./Test-Results/gnn-cot_test/gnn-cot_test02-20_500_fusion"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
-# 确保目标目录存在，不存在则创建
-os.makedirs(TARGET_SAVE_DIR, exist_ok=True)
-
-PROMPT_TEXT = "Is this image fake or real? Answer ONLY with 'fake' or 'real' (no extra words)."
+# Keep this exactly aligned with blip2_detect_aligned.py. The LoRA head is sensitive to
+# tiny prompt changes because training masks loss only on the final answer tokens.
+PROMPT_TEXT = "Is this image fake or real? Answer ONLY with 'fake' or 'real'(no extra words)."
+SCORING_PROMPTS = [
+    PROMPT_TEXT,
+    "Question: Is this image fake or real? Answer only fake or real.",
+    "Classify this image as fake or real. Answer with one word: fake or real.",
+]
 STRUCTURED_COT_PROMPT = (
     "You are a forensic image analyst. Decide whether the image is fake or real. "
     "Return exactly four lines with these fields: Quick intuition, Salient evidence, "
@@ -192,34 +183,65 @@ def class_targets_for_scoring(structured_cot):
     return [" real", " fake"]
 
 
-def lm_fake_probability(model, processor, image, device, score_mode):
+def image_variants(image, tta_mode):
+    variants = [image]
+    if tta_mode in ("hflip", "all"):
+        variants.append(image.transpose(Image.FLIP_LEFT_RIGHT))
+    return variants
+
+
+def prompts_for_scoring(score_mode, prompt_ensemble):
+    if score_mode == "cot":
+        return [STRUCTURED_COT_PROMPT]
+    return SCORING_PROMPTS if prompt_ensemble else [PROMPT_TEXT]
+
+
+def lm_fake_probability(
+    model,
+    processor,
+    image,
+    device,
+    score_mode,
+    prompt_ensemble=False,
+    tta_mode="none",
+    ensemble_reduce="prob",
+):
     use_cot_score = score_mode == "cot"
-    prompt = STRUCTURED_COT_PROMPT if use_cot_score else PROMPT_TEXT
     target_texts = class_targets_for_scoring(use_cot_score)
-    losses = []
-    for target_text in target_texts:
-        text = prompt + target_text
-        inputs = processor(images=image, text=text, return_tensors="pt")
-        labels = build_labels_for_targets(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            target_texts=[target_text],
-            tokenizer=processor.tokenizer,
-        )
-        inputs = move_inputs_to_device(inputs, device)
-        labels = labels.to(device)
+    fake_probs = []
+    fake_logits = []
+    for variant in image_variants(image, tta_mode):
+        for prompt in prompts_for_scoring(score_mode, prompt_ensemble):
+            losses = []
+            for target_text in target_texts:
+                text = prompt + target_text
+                inputs = processor(images=variant, text=text, return_tensors="pt")
+                labels = build_labels_for_targets(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    target_texts=[target_text],
+                    tokenizer=processor.tokenizer,
+                )
+                inputs = move_inputs_to_device(inputs, device)
+                labels = labels.to(device)
 
-        outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pixel_values=inputs["pixel_values"],
-            labels=labels,
-        )
-        losses.append(outputs.loss.detach().float())
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"],
+                    labels=labels,
+                )
+                losses.append(outputs.loss.detach().float())
 
-    nll = torch.stack(losses)
-    probs = torch.softmax(-nll, dim=0)
-    return probs[1].item()
+            nll = torch.stack(losses)
+            fake_logit = nll[0] - nll[1]
+            fake_logits.append(fake_logit)
+            if ensemble_reduce == "prob":
+                probs = torch.softmax(-nll, dim=0)
+                fake_probs.append(probs[1])
+    if ensemble_reduce == "logit":
+        return torch.sigmoid(torch.stack(fake_logits).mean()).item()
+    return torch.stack(fake_probs).mean().item()
 
 
 def resolve_lora_checkpoint(model_path):
@@ -268,6 +290,14 @@ def resolve_gnn_head_path(gnn_head_path, model_path):
     raise FileNotFoundError(f"Cannot find GNN head at {gnn_head_path} or {fallback}.")
 
 
+def normalize_image_path(image_path, opt):
+    image_path = str(image_path)
+    if opt.path_prefix_from and opt.path_prefix_to and image_path.startswith(opt.path_prefix_from):
+        suffix = image_path[len(opt.path_prefix_from):].lstrip("/\\")
+        image_path = os.path.join(opt.path_prefix_to, suffix)
+    return image_path
+
+
 def _metric_value(y_true, y_pred, metric_name):
     if metric_name == "accuracy":
         return accuracy_score(y_true, y_pred)
@@ -301,7 +331,7 @@ def find_best_threshold(y_true, y_score, metric_name="f1"):
     return best_threshold, best_metric
 
 
-def find_best_fusion_weight(y_true, lm_score, gnn_score):
+def find_best_fusion_weight(y_true, lm_score, gnn_score, metric_name="auc", grid_steps=101):
     y_true = np.asarray(y_true, dtype=int)
     lm_score = np.asarray(lm_score, dtype=float)
     gnn_score = np.asarray(gnn_score, dtype=float)
@@ -310,20 +340,43 @@ def find_best_fusion_weight(y_true, lm_score, gnn_score):
         return 0.0, lm_score
 
     best_weight = 0.0
-    best_auc = -1.0
+    best_metric = -1.0
     best_score = lm_score
-    for weight in np.linspace(0.0, 1.0, 21):
+    grid_steps = max(2, int(grid_steps))
+    for weight in np.linspace(0.0, 1.0, grid_steps):
         score = (1.0 - weight) * lm_score + weight * gnn_score
-        try:
-            fpr, tpr, _ = roc_curve(y_true[valid], score[valid])
-            auc_score = auc(fpr, tpr)
-        except ValueError:
-            auc_score = -1.0
-        if auc_score > best_auc:
-            best_auc = auc_score
+        if metric_name == "auc":
+            try:
+                fpr, tpr, _ = roc_curve(y_true[valid], score[valid])
+                metric = auc(fpr, tpr)
+            except ValueError:
+                metric = -1.0
+        else:
+            _, metric = find_best_threshold(y_true[valid], score[valid], metric_name)
+        if metric > best_metric:
+            best_metric = metric
             best_weight = float(weight)
             best_score = score
     return best_weight, best_score
+
+
+def gnn_fake_probability(gnn_head, processor, image, prompt_text, device, tta_mode="none"):
+    probs = []
+    first_outputs = None
+    for variant in image_variants(image, tta_mode):
+        inputs = move_inputs_to_device(
+            processor(images=variant, text=prompt_text, return_tensors="pt"),
+            device,
+        )
+        graph_outputs = gnn_head(
+            pixel_values=inputs["pixel_values"],
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+        )
+        if first_outputs is None:
+            first_outputs = graph_outputs
+        probs.append(graph_outputs["logits"].softmax(dim=-1)[0, 1])
+    return torch.stack(probs).mean().item(), first_outputs
 
 
 # def plot_single_roc(y_true, y_pred, dataset_name, save_path):
@@ -459,7 +512,7 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     max_new_tokens = opt.max_new_tokens if opt.structured_cot else 1
 
     for i, row in tqdm.tqdm(test_df.iterrows(), total=len(test_df), desc=f"Testing {dataset_name}"):
-        image_path = row["image"]
+        image_path = normalize_image_path(row["image"], opt)
         if not os.path.exists(image_path):
             print(f"[跳过] 找不到图像: {image_path}")
             results.append("error")
@@ -488,6 +541,9 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
                     image=image,
                     device=device,
                     score_mode=opt.score_mode,
+                    prompt_ensemble=opt.prompt_ensemble,
+                    tta_mode=opt.tta,
+                    ensemble_reduce=opt.ensemble_reduce,
                 )
                 pred_text = ""
                 if opt.generate_reports or opt.decision_source == "generate":
@@ -503,12 +559,14 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
                 graph_label = None
                 evidence_text = ""
                 if gnn_head is not None:
-                    graph_outputs = gnn_head(
-                        pixel_values=inputs["pixel_values"],
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
+                    graph_prob_fake, graph_outputs = gnn_fake_probability(
+                        gnn_head=gnn_head,
+                        processor=processor,
+                        image=image,
+                        prompt_text=prompt_text,
+                        device=device,
+                        tta_mode=opt.tta,
                     )
-                    graph_prob_fake = graph_outputs["logits"].softmax(dim=-1)[0, 1].item()
                     graph_label = int(graph_prob_fake >= 0.5)
                     evidence = format_top_patches(graph_outputs, top_k=opt.gnn_top_k)
                     evidence_text = evidence[0] if evidence else ""
@@ -574,10 +632,19 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     if opt.auto_fusion_weight:
         lm_score = result_df["LMFakeProb"].astype(float).to_numpy()
         gnn_score = result_df["GNNFakeProb"].astype(float).to_numpy()
-        applied_fusion_weight, fused_score = find_best_fusion_weight(y_true, lm_score, gnn_score)
+        applied_fusion_weight, fused_score = find_best_fusion_weight(
+            y_true,
+            lm_score,
+            gnn_score,
+            metric_name=opt.fusion_metric,
+            grid_steps=opt.fusion_grid_steps,
+        )
         y_score = pd.Series(fused_score, index=result_df.index).fillna(0.0)
         result_df["FakeScore"] = y_score
-        result_df["DecisionSource"] = f"auto_fusion:{applied_fusion_weight:.2f}"
+        result_df["DecisionSource"] = f"auto_fusion:{opt.fusion_metric}:{applied_fusion_weight:.2f}"
+        print(f"[INFO] 自动融合权重({opt.fusion_metric}) GNN={applied_fusion_weight:.4f}, LM={1.0 - applied_fusion_weight:.4f}")
+        if applied_fusion_weight <= 1e-12:
+            print("[INFO] 自动融合选择了 GNN=0，说明当前 GNN 分数没有提升排序/阈值指标，结果会与 lm 基本一致。")
 
     applied_threshold = opt.threshold
     if opt.auto_threshold:
@@ -612,12 +679,12 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     print("====================")
 
     # 保存结果CSV（核心修改点2：改为目标目录）
-    save_path = os.path.join(TARGET_SAVE_DIR, f"result_{dataset_name}.csv")
+    save_path = os.path.join(opt.save_dir, f"result_{dataset_name}.csv")
     result_df.to_csv(save_path, index=False)
     print(f"[INFO] 结果已保存至 {save_path}")
 
     # 绘制并保存单个ROC曲线（核心修改点3：改为目标目录）
-    roc_save_path = os.path.join(TARGET_SAVE_DIR, f"roc_{dataset_name}.png")
+    roc_save_path = os.path.join(opt.save_dir, f"roc_{dataset_name}.png")
     fpr, tpr, auc_score = plot_single_roc(y_true, y_score, dataset_name, roc_save_path)
     print(f"[INFO] ROC曲线已保存至 {roc_save_path}")
 
@@ -630,7 +697,7 @@ def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
         "auc": auc_score,
         "accuracy": accuracy,
         "f1": f1,
-        "save_dir": TARGET_SAVE_DIR  # 核心修改点4：返回目标目录
+        "save_dir": opt.save_dir  # 核心修改点4：返回目标目录
     }
 
 
@@ -645,11 +712,17 @@ if __name__ == "__main__":
                         help="Path to fine-tuned LoRA weights")
     parser.add_argument("--dataset", type=str, nargs='+', required=True,  # 支持多个数据集
                         help="Paths to test CSV files (multiple allowed)")
+    parser.add_argument("--save_dir", type=str, default=None,
+                        help="Directory used to save result CSVs and ROC figures.")
     parser.add_argument("--base_model", type=str,
                         default="/root/autodl-tmp/project/VLM-DETECT-main/blip2-opt-2.7b",
                         help="Path to BLIP2 base model")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Optional: number of samples to test (randomly sampled)")
+    parser.add_argument("--path_prefix_from", type=str, default=None,
+                        help="Optional old image path prefix to replace when loading CSV rows.")
+    parser.add_argument("--path_prefix_to", type=str, default=None,
+                        help="Optional new image path prefix used with --path_prefix_from.")
     parser.add_argument("--structured_cot", action="store_true",
                         help="生成 quick intuition / salient evidence / deep reasoning / final conclusion 四步报告")
     parser.add_argument("--max_new_tokens", type=int, default=96,
@@ -665,6 +738,12 @@ if __name__ == "__main__":
                         help="Decision source: lm uses fake/real likelihood scoring; fusion blends LM and GNN.")
     parser.add_argument("--score_mode", type=str, default="short", choices=["short", "cot"],
                         help="LM scoring target. short uses real/fake answers; cot scores full CoT templates.")
+    parser.add_argument("--ensemble_reduce", type=str, default="prob", choices=["prob", "logit"],
+                        help="How to combine prompt/TTA LM scores. logit often gives sharper ensemble ranking.")
+    parser.add_argument("--prompt_ensemble", action="store_true",
+                        help="Average fake/real likelihoods across several classification prompts.")
+    parser.add_argument("--tta", type=str, default="none", choices=["none", "hflip", "all"],
+                        help="Test-time augmentation mode. hflip averages original and horizontal flip.")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Fake probability threshold used for accuracy/F1.")
     parser.add_argument("--auto_threshold", action="store_true",
@@ -672,12 +751,23 @@ if __name__ == "__main__":
     parser.add_argument("--threshold_metric", type=str, default="f1", choices=["f1", "accuracy"],
                         help="Metric used by --auto_threshold.")
     parser.add_argument("--auto_fusion_weight", action="store_true",
-                        help="Sweep LM/GNN fusion weights by AUC when both scores are available.")
+                        help="Sweep LM/GNN fusion weights when both scores are available.")
+    parser.add_argument("--fusion_metric", type=str, default="auc", choices=["auc", "f1", "accuracy"],
+                        help="Metric used by --auto_fusion_weight.")
+    parser.add_argument("--fusion_grid_steps", type=int, default=101,
+                        help="Number of LM/GNN fusion weights to sweep from 0 to 1.")
     parser.add_argument("--generate_reports", action="store_true",
                         help="Generate CoT text reports. Classification does not depend on generated text by default.")
     opt = parser.parse_args()
     opt.gnn_vote_weight = min(max(opt.gnn_vote_weight, 0.0), 1.0)
     opt.threshold = min(max(opt.threshold, 0.0), 1.0)
+    if opt.save_dir is None:
+        first_dataset = os.path.basename(opt.dataset[0]).split('.')[0].replace('test_', '')
+        model_name = os.path.basename(os.path.normpath(opt.model_path))
+        sample_tag = f"sample{opt.num_samples}" if opt.num_samples is not None else "all"
+        opt.save_dir = os.path.join("./Test-Results", f"In_{first_dataset}_Results", f"{model_name}-{sample_tag}")
+    os.makedirs(opt.save_dir, exist_ok=True)
+    print(f"[INFO] 结果保存目录: {opt.save_dir}")
 
     # ===========================
     # 模型加载
@@ -712,12 +802,12 @@ if __name__ == "__main__":
 
     # 生成汇总ROC曲线（核心修改点5：改为目标目录）
     if all_results:
-        combined_roc_path = os.path.join(TARGET_SAVE_DIR, "combined_roc.png")
+        combined_roc_path = os.path.join(opt.save_dir, "combined_roc.png")
         plot_combined_roc(all_results, combined_roc_path)
         print(f"[INFO] 汇总ROC曲线已保存至 {combined_roc_path}")
 
         # 生成性能表格（核心修改点6：改为目标目录）
-        table_path = os.path.join(TARGET_SAVE_DIR, "performance_table.png")
+        table_path = os.path.join(opt.save_dir, "performance_table.png")
         generate_performance_table(all_results, table_path)
         print(f"[INFO] 性能指标表格已保存至 {table_path}")
 
