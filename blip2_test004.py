@@ -23,6 +23,15 @@ python blip2_test004.py \
               ./data/Test_CSV/test_ProjectedGAN.csv \
     --num_samples 500
 
+python blip2_test004.py \
+  --base_model ./blip2-opt-2.7b \
+  --model_path ./SaveFineTune/LDM-gnn-cot_test/epoch020 \
+  --gnn_head_path ./SaveFineTune/LDM-gnn-cot_test/epoch020/gnn_cot_head.pt \
+  --dataset ./data/Test_CSV/test_LDM.csv \
+  --structured_cot \
+  --num_samples 500 \
+  --decision_source lm
+
 #自己训练--model_path    ./SaveFineTune/LDM-train-epochs03
 改63行
 和6的基础上运行时去掉字体提示
@@ -42,7 +51,10 @@ from peft import PeftModel
 import tqdm
 import time
 import argparse
+import re
+from PIL import Image
 import matplotlib.font_manager as fm  # 添加这行导入语句
+from gnn_cot import extract_blip2_vision_tokens, format_top_patches, load_gnn_cot_head
 
 import warnings  # 后加
 import logging
@@ -69,9 +81,33 @@ if torch.cuda.is_available():
 # ===========================
 # 定义目标保存目录（核心修改点1）
 # ===========================
-TARGET_SAVE_DIR = "./Test-Results/GAN/In_PNDM_Results/aligned-sample500-00020-In_PNDM_Results"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
+TARGET_SAVE_DIR = "./Test-Results/gnn-cot_test/gnn-cot_test00-20_500_autofusion"     # In_ADM_Results/In_ADM_Results/sample500-In_ADM_Results   sample500-   all-In_LDM_Results   sample5000-aligned--00020-In_LDM_Results
 # 确保目标目录存在，不存在则创建
 os.makedirs(TARGET_SAVE_DIR, exist_ok=True)
+
+PROMPT_TEXT = "Is this image fake or real? Answer ONLY with 'fake' or 'real' (no extra words)."
+STRUCTURED_COT_PROMPT = (
+    "You are a forensic image analyst. Decide whether the image is fake or real. "
+    "Return exactly four lines with these fields: Quick intuition, Salient evidence, "
+    "Deep reasoning, Final conclusion."
+)
+
+COT_TEMPLATES = {
+    0: (
+        "Quick intuition: real.\n"
+        "Salient evidence: no localized manipulation cue is dominant in the visible regions.\n"
+        "Deep reasoning: the spatial content and frequency texture are mutually consistent, "
+        "so the forensic evidence supports an authentic image.\n"
+        "Final conclusion: real."
+    ),
+    1: (
+        "Quick intuition: fake.\n"
+        "Salient evidence: localized visual artifacts and frequency inconsistency are suspicious.\n"
+        "Deep reasoning: the spatial content and frequency texture are not fully aligned, "
+        "so the forensic evidence supports a synthetic or manipulated image.\n"
+        "Final conclusion: fake."
+    ),
+}
 
 
 # ===========================
@@ -91,6 +127,203 @@ def map_text_to_binary(text):
     else:
         print(f"[警告] 无法识别文本: '{text}'，默认标记为0（real）")
         return 0
+
+
+def extract_final_label(text):
+    """Prefer the explicit final conclusion in a structured CoT report."""
+    text_lower = str(text).lower().strip()
+    final_match = re.search(r"final\s*(?:conclusion|answer)?\s*[:：]\s*(fake|real)", text_lower)
+    if final_match:
+        return 1 if final_match.group(1) == "fake" else 0
+
+    for line in reversed(text_lower.splitlines()):
+        if "fake" in line:
+            return 1
+        if "real" in line:
+            return 0
+    return map_text_to_binary(text)
+
+
+def label_to_text(label):
+    return "fake" if int(label) == 1 else "real"
+
+
+def move_inputs_to_device(inputs, device):
+    moved = {}
+    for key, value in inputs.items():
+        if key == "pixel_values":
+            moved[key] = value.to(device=device, dtype=torch.float16)
+        else:
+            moved[key] = value.to(device=device)
+    return moved
+
+
+def find_subsequence(sequence, pattern):
+    if len(pattern) == 0 or len(pattern) > len(sequence):
+        return None
+    last_start = len(sequence) - len(pattern)
+    for start in range(last_start + 1):
+        if sequence[start : start + len(pattern)] == pattern:
+            return start
+    return None
+
+
+def build_labels_for_targets(input_ids, attention_mask, target_texts, tokenizer):
+    labels = torch.full_like(input_ids, fill_value=-100)
+    for row_idx, target_text in enumerate(target_texts):
+        target_ids = tokenizer(target_text, add_special_tokens=False).input_ids
+        valid_positions = attention_mask[row_idx].nonzero(as_tuple=False).flatten()
+        target_len = min(len(target_ids), int(valid_positions.numel()))
+        if target_len == 0:
+            continue
+        valid_token_ids = input_ids[row_idx, valid_positions].tolist()
+        match_start = find_subsequence(valid_token_ids, target_ids[:target_len])
+        if match_start is not None:
+            target_positions = valid_positions[match_start : match_start + target_len]
+        else:
+            target_positions = valid_positions[-target_len:]
+        labels[row_idx, target_positions] = input_ids[row_idx, target_positions]
+    return labels
+
+
+def class_targets_for_scoring(structured_cot):
+    if structured_cot:
+        return ["\n" + COT_TEMPLATES[0], "\n" + COT_TEMPLATES[1]]
+    return [" real", " fake"]
+
+
+def lm_fake_probability(model, processor, image, device, score_mode):
+    use_cot_score = score_mode == "cot"
+    prompt = STRUCTURED_COT_PROMPT if use_cot_score else PROMPT_TEXT
+    target_texts = class_targets_for_scoring(use_cot_score)
+    losses = []
+    for target_text in target_texts:
+        text = prompt + target_text
+        inputs = processor(images=image, text=text, return_tensors="pt")
+        labels = build_labels_for_targets(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            target_texts=[target_text],
+            tokenizer=processor.tokenizer,
+        )
+        inputs = move_inputs_to_device(inputs, device)
+        labels = labels.to(device)
+
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pixel_values=inputs["pixel_values"],
+            labels=labels,
+        )
+        losses.append(outputs.loss.detach().float())
+
+    nll = torch.stack(losses)
+    probs = torch.softmax(-nll, dim=0)
+    return probs[1].item()
+
+
+def resolve_lora_checkpoint(model_path):
+    if os.path.isfile(os.path.join(model_path, "adapter_config.json")):
+        return model_path
+
+    if os.path.isdir(model_path):
+        epoch_dirs = []
+        for name in os.listdir(model_path):
+            candidate = os.path.join(model_path, name)
+            if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "adapter_config.json")):
+                epoch_dirs.append(candidate)
+        if epoch_dirs:
+            return sorted(epoch_dirs)[-1]
+
+    search_root = model_path
+    while search_root and not os.path.isdir(search_root):
+        parent = os.path.dirname(search_root)
+        if parent == search_root:
+            break
+        search_root = parent
+
+    nearby = []
+    if search_root and os.path.isdir(search_root):
+        for root, _, files in os.walk(search_root):
+            if "adapter_config.json" in files:
+                nearby.append(root)
+                if len(nearby) >= 10:
+                    break
+
+    message = f"Cannot find adapter_config.json at {model_path}."
+    if nearby:
+        message += "\nAvailable LoRA checkpoints nearby:\n" + "\n".join(f"  - {path}" for path in nearby)
+    raise FileNotFoundError(message)
+
+
+def resolve_gnn_head_path(gnn_head_path, model_path):
+    if gnn_head_path is None:
+        candidate = os.path.join(model_path, "gnn_cot_head.pt")
+        return candidate if os.path.isfile(candidate) else None
+    if os.path.isfile(gnn_head_path):
+        return gnn_head_path
+    fallback = os.path.join(model_path, "gnn_cot_head.pt")
+    if os.path.isfile(fallback):
+        return fallback
+    raise FileNotFoundError(f"Cannot find GNN head at {gnn_head_path} or {fallback}.")
+
+
+def _metric_value(y_true, y_pred, metric_name):
+    if metric_name == "accuracy":
+        return accuracy_score(y_true, y_pred)
+    return f1_score(y_true, y_pred)
+
+
+def find_best_threshold(y_true, y_score, metric_name="f1"):
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    valid = np.isfinite(y_score)
+    y_true = y_true[valid]
+    y_score = y_score[valid]
+    if y_score.size == 0:
+        return 0.5, 0.0
+
+    unique_scores = np.unique(y_score)
+    candidates = [float(unique_scores[0]) - 1e-12, float(unique_scores[-1]) + 1e-12]
+    candidates.extend(float(score) for score in unique_scores)
+    if unique_scores.size > 1:
+        mids = (unique_scores[:-1] + unique_scores[1:]) / 2.0
+        candidates.extend(float(score) for score in mids)
+
+    best_threshold = 0.5
+    best_metric = -1.0
+    for threshold in candidates:
+        y_pred = (y_score >= threshold).astype(int)
+        metric = _metric_value(y_true, y_pred, metric_name)
+        if metric > best_metric:
+            best_metric = metric
+            best_threshold = threshold
+    return best_threshold, best_metric
+
+
+def find_best_fusion_weight(y_true, lm_score, gnn_score):
+    y_true = np.asarray(y_true, dtype=int)
+    lm_score = np.asarray(lm_score, dtype=float)
+    gnn_score = np.asarray(gnn_score, dtype=float)
+    valid = np.isfinite(lm_score) & np.isfinite(gnn_score)
+    if not valid.any():
+        return 0.0, lm_score
+
+    best_weight = 0.0
+    best_auc = -1.0
+    best_score = lm_score
+    for weight in np.linspace(0.0, 1.0, 21):
+        score = (1.0 - weight) * lm_score + weight * gnn_score
+        try:
+            fpr, tpr, _ = roc_curve(y_true[valid], score[valid])
+            auc_score = auc(fpr, tpr)
+        except ValueError:
+            auc_score = -1.0
+        if auc_score > best_auc:
+            best_auc = auc_score
+            best_weight = float(weight)
+            best_score = score
+    return best_weight, best_score
 
 
 # def plot_single_roc(y_true, y_pred, dataset_name, save_path):
@@ -200,7 +433,7 @@ def generate_performance_table(all_results, save_path):
     plt.close()
 
 
-def process_dataset(dataset_path, model, processor, device, opt):
+def process_dataset(dataset_path, model, processor, device, opt, gnn_head=None):
     """处理单个数据集并返回结果"""
     # 提取数据集名称
     dataset_name = os.path.basename(dataset_path).split('.')[0].replace('test_', '')
@@ -215,40 +448,112 @@ def process_dataset(dataset_path, model, processor, device, opt):
 
     # 推理阶段
     results = []
+    text_results = []
+    lm_fake_probs = []
+    cot_reports = []
+    gnn_fake_probs = []
+    fake_scores = []
+    gnn_evidence = []
     start_time = time.time()
-    prompt_text = "Is this image fake or real? Answer ONLY with 'fake' or 'real' (no extra words)."
+    prompt_text = STRUCTURED_COT_PROMPT if opt.structured_cot else PROMPT_TEXT
+    max_new_tokens = opt.max_new_tokens if opt.structured_cot else 1
 
     for i, row in tqdm.tqdm(test_df.iterrows(), total=len(test_df), desc=f"Testing {dataset_name}"):
         image_path = row["image"]
         if not os.path.exists(image_path):
             print(f"[跳过] 找不到图像: {image_path}")
+            results.append("error")
+            text_results.append("error")
+            lm_fake_probs.append(np.nan)
+            cot_reports.append("missing image")
+            gnn_fake_probs.append(np.nan)
+            fake_scores.append(np.nan)
+            gnn_evidence.append("")
             continue
 
         try:
             # 处理输入
-            inputs = processor(
-                images=image_path,
+            image = Image.open(image_path).convert("RGB")
+            inputs = move_inputs_to_device(processor(
+                images=image,
                 text=prompt_text,
                 return_tensors="pt"
-            ).to(device, torch.float16)
+            ), device)
 
             # 执行推理
             with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=1,
-                    num_beams=3,
-                    do_sample=False
+                lm_prob_fake = lm_fake_probability(
+                    model=model,
+                    processor=processor,
+                    image=image,
+                    device=device,
+                    score_mode=opt.score_mode,
                 )
+                pred_text = ""
+                if opt.generate_reports or opt.decision_source == "generate":
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=3,
+                        do_sample=False
+                    )
+                    pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    pred_text = pred_text.replace(prompt_text, "").strip()
+                graph_prob_fake = np.nan
+                graph_label = None
+                evidence_text = ""
+                if gnn_head is not None:
+                    vision_embeds = (
+                        extract_blip2_vision_tokens(model, inputs["pixel_values"])
+                        if opt.gnn_use_vision_tokens
+                        else None
+                    )
+                    graph_outputs = gnn_head(
+                        pixel_values=inputs["pixel_values"],
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        vision_embeds=vision_embeds,
+                    )
+                    graph_prob_fake = graph_outputs["logits"].softmax(dim=-1)[0, 1].item()
+                    graph_label = int(graph_prob_fake >= 0.5)
+                    evidence = format_top_patches(graph_outputs, top_k=opt.gnn_top_k)
+                    evidence_text = evidence[0] if evidence else ""
 
             # 解码结果
-            pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            pred_text = pred_text.replace(prompt_text, "").strip()
-            results.append(pred_text)
+            generated_label = None
+            if pred_text:
+                generated_label = extract_final_label(pred_text) if opt.structured_cot else map_text_to_binary(pred_text)
+
+            lm_label = int(lm_prob_fake >= opt.threshold)
+            text_label = generated_label if opt.decision_source == "generate" and generated_label is not None else lm_label
+
+            if opt.decision_source == "gnn" and graph_label is not None:
+                final_score = graph_prob_fake
+            elif opt.decision_source == "fusion" and graph_label is not None:
+                final_score = opt.gnn_vote_weight * graph_prob_fake + (1.0 - opt.gnn_vote_weight) * lm_prob_fake
+            elif opt.decision_source == "generate" and generated_label is not None:
+                final_score = float(generated_label)
+            else:
+                final_score = lm_prob_fake
+            final_label = int(final_score >= opt.threshold)
+
+            results.append(label_to_text(final_label))
+            text_results.append(label_to_text(text_label))
+            lm_fake_probs.append(lm_prob_fake)
+            cot_reports.append(pred_text)
+            gnn_fake_probs.append(graph_prob_fake)
+            fake_scores.append(final_score)
+            gnn_evidence.append(evidence_text)
 
         except Exception as e:
             print(f"[错误] 图像 {image_path} 推理失败: {e}")
             results.append("error")
+            text_results.append("error")
+            lm_fake_probs.append(np.nan)
+            cot_reports.append(f"error: {e}")
+            gnn_fake_probs.append(np.nan)
+            fake_scores.append(np.nan)
+            gnn_evidence.append("")
 
     end_time = time.time()
     print(f"[INFO] {dataset_name} 推理完成，耗时 {end_time - start_time:.2f} 秒")
@@ -259,8 +564,37 @@ def process_dataset(dataset_path, model, processor, device, opt):
         "GT": test_df["text"],
         "Tlabel": test_df["text"].apply(map_text_to_binary),
         "Pred": results,
-        "Plabel": [map_text_to_binary(x) for x in results],
+        "TextPred": text_results,
+        "LMFakeProb": lm_fake_probs,
+        "GNNFakeProb": gnn_fake_probs,
+        "FakeScore": fake_scores,
+        "DecisionSource": opt.decision_source,
+        "GNNEvidence": gnn_evidence,
+        "CoTReport": cot_reports,
     })
+
+    y_true = result_df["Tlabel"].astype(int)
+    y_score = result_df["FakeScore"].astype(float).fillna(0.0)
+
+    applied_fusion_weight = opt.gnn_vote_weight
+    if opt.auto_fusion_weight:
+        lm_score = result_df["LMFakeProb"].astype(float).to_numpy()
+        gnn_score = result_df["GNNFakeProb"].astype(float).to_numpy()
+        applied_fusion_weight, fused_score = find_best_fusion_weight(y_true, lm_score, gnn_score)
+        y_score = pd.Series(fused_score, index=result_df.index).fillna(0.0)
+        result_df["FakeScore"] = y_score
+        result_df["DecisionSource"] = f"auto_fusion:{applied_fusion_weight:.2f}"
+
+    applied_threshold = opt.threshold
+    if opt.auto_threshold:
+        applied_threshold, best_metric = find_best_threshold(y_true, y_score, opt.threshold_metric)
+        print(f"[INFO] 自动阈值({opt.threshold_metric})={applied_threshold:.12f}, best={best_metric:.4f}")
+
+    y_pred = (y_score >= applied_threshold).astype(int)
+    result_df["Plabel"] = y_pred
+    result_df["Pred"] = result_df["Plabel"].apply(label_to_text)
+    result_df["AppliedThreshold"] = applied_threshold
+    result_df["AppliedFusionWeight"] = applied_fusion_weight
 
     # 打印预测分布
     print(f"\n[INFO] {dataset_name} 预测分布:")
@@ -272,10 +606,9 @@ def process_dataset(dataset_path, model, processor, device, opt):
         print(f"[警告] {dataset_name} 所有预测结果相同！请检查模型或数据。")
 
     # 计算指标
-    y_true, y_pred = result_df["Tlabel"], result_df["Plabel"]
     accuracy = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
-    fpr, tpr, _ = roc_curve(y_true, y_pred)
+    fpr, tpr, _ = roc_curve(y_true, y_score)
     auc_score = auc(fpr, tpr)
 
     print(f"\n=== {dataset_name} 指标 ===")
@@ -291,7 +624,7 @@ def process_dataset(dataset_path, model, processor, device, opt):
 
     # 绘制并保存单个ROC曲线（核心修改点3：改为目标目录）
     roc_save_path = os.path.join(TARGET_SAVE_DIR, f"roc_{dataset_name}.png")
-    fpr, tpr, auc_score = plot_single_roc(y_true, y_pred, dataset_name, roc_save_path)
+    fpr, tpr, auc_score = plot_single_roc(y_true, y_score, dataset_name, roc_save_path)
     print(f"[INFO] ROC曲线已保存至 {roc_save_path}")
 
     return {
@@ -323,7 +656,38 @@ if __name__ == "__main__":
                         help="Path to BLIP2 base model")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Optional: number of samples to test (randomly sampled)")
+    parser.add_argument("--structured_cot", action="store_true",
+                        help="生成 quick intuition / salient evidence / deep reasoning / final conclusion 四步报告")
+    parser.add_argument("--max_new_tokens", type=int, default=96,
+                        help="structured_cot 模式下的最大生成 token 数")
+    parser.add_argument("--gnn_head_path", type=str, default=None,
+                        help="可选：加载训练保存的 gnn_cot_head.pt，用图分支融合判决")
+    parser.add_argument("--gnn_vote_weight", type=float, default=0.5,
+                        help="融合判决时 GNN fake 概率的权重，范围 0-1")
+    parser.add_argument("--gnn_top_k", type=int, default=3,
+                        help="保存 GNN 证据热区时保留的 top-k patch 数")
+    parser.add_argument("--gnn_use_vision_tokens", action="store_true", default=True,
+                        help="Use frozen BLIP2 vision tokens when evaluating the graph head.")
+    parser.add_argument("--gnn_no_vision_tokens", action="store_false", dest="gnn_use_vision_tokens",
+                        help="Disable BLIP2 vision-token graph features.")
+    parser.add_argument("--decision_source", type=str, default="lm",
+                        choices=["lm", "gnn", "fusion", "generate"],
+                        help="Decision source: lm uses fake/real likelihood scoring; fusion blends LM and GNN.")
+    parser.add_argument("--score_mode", type=str, default="short", choices=["short", "cot"],
+                        help="LM scoring target. short uses real/fake answers; cot scores full CoT templates.")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Fake probability threshold used for accuracy/F1.")
+    parser.add_argument("--auto_threshold", action="store_true",
+                        help="Sweep thresholds on the evaluated data and apply the best one.")
+    parser.add_argument("--threshold_metric", type=str, default="f1", choices=["f1", "accuracy"],
+                        help="Metric used by --auto_threshold.")
+    parser.add_argument("--auto_fusion_weight", action="store_true",
+                        help="Sweep LM/GNN fusion weights by AUC when both scores are available.")
+    parser.add_argument("--generate_reports", action="store_true",
+                        help="Generate CoT text reports. Classification does not depend on generated text by default.")
     opt = parser.parse_args()
+    opt.gnn_vote_weight = min(max(opt.gnn_vote_weight, 0.0), 1.0)
+    opt.threshold = min(max(opt.threshold, 0.0), 1.0)
 
     # ===========================
     # 模型加载
@@ -337,16 +701,23 @@ if __name__ == "__main__":
         torch_dtype=torch.float16
     )
 
+    opt.model_path = resolve_lora_checkpoint(opt.model_path)
     print(f"[INFO] 加载微调LoRA权重: {opt.model_path}")
     model = PeftModel.from_pretrained(model, opt.model_path)
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=True)
+    processor = AutoProcessor.from_pretrained(opt.base_model, use_fast=False)
+    gnn_head = None
+    opt.gnn_head_path = resolve_gnn_head_path(opt.gnn_head_path, opt.model_path)
+    if opt.gnn_head_path is not None:
+        print(f"[INFO] 加载 GNN-CoT 头: {opt.gnn_head_path}")
+        gnn_head = load_gnn_cot_head(opt.gnn_head_path, processor.tokenizer, map_location=device).to(device)
+        gnn_head.eval()
 
     # 处理所有数据集
     all_results = []
     for dataset_path in opt.dataset:
-        result = process_dataset(dataset_path, model, processor, device, opt)
+        result = process_dataset(dataset_path, model, processor, device, opt, gnn_head=gnn_head)
         all_results.append(result)
 
     # 生成汇总ROC曲线（核心修改点5：改为目标目录）
