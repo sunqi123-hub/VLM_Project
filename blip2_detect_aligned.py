@@ -663,3 +663,25 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     train(args)
+
+"""
+python blip2_detect_aligned.py \
+  --dataset ./data/Train_CSV_Balanced/train_LDM_balanced.csv \
+  --base_model ./blip2-opt-2.7b \
+  --epochs 20 \
+  --batch_size 24 \
+  --num_workers 4 \
+  --save_path ./SaveFineTune/LDM-vlm-gnn-01 \
+  --use_gnn_cot \
+  --gnn_short_answer \
+  --gnn_grid_size 4 \
+  --gnn_hidden_dim 256 \
+  --gnn_layers 2 \
+  --gnn_heads 4 \
+  --gnn_forensic_nodes 8 \
+  --gnn_semantic_top_k 4 \
+  --gnn_loss_weight 0.4 \
+  --cls_loss_weight 0.5 \
+  --rlhf_reward_weight 0.05 
+
+"""
