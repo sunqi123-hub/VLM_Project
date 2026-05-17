@@ -16,6 +16,9 @@ class GNNCoTConfig:
     num_layers: int = 2
     num_heads: int = 4
     dropout: float = 0.1
+    visual_feature_dim: int = 1408
+    forensic_nodes: int = 8
+    semantic_top_k: int = 4
 
 
 class PatchGraphEncoder(nn.Module):
@@ -25,22 +28,46 @@ class PatchGraphEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.spatial_proj = nn.Linear(6, config.hidden_dim)
-        self.frequency_proj = nn.Linear(6, config.hidden_dim)
+        self.vision_proj = nn.Linear(config.visual_feature_dim, config.hidden_dim)
+        self.spatial_gate = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
+            nn.Sigmoid(),
+        )
+        self.frequency_proj = nn.Linear(12, config.hidden_dim)
         self.text_embedding = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.forensic_nodes = nn.Parameter(torch.randn(config.forensic_nodes, config.hidden_dim) * 0.02)
         self.type_embedding = nn.Embedding(3, config.hidden_dim)
         self.position_embedding = nn.Embedding(config.image_grid_size * config.image_grid_size, config.hidden_dim)
 
-    def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        vision_embeds: Optional[torch.Tensor] = None,
+    ):
         pixel_values = pixel_values.float()
         batch_size = pixel_values.shape[0]
         grid = self.config.image_grid_size
 
-        spatial = self._patch_stats(pixel_values, grid)
-        spatial = self.spatial_proj(spatial)
+        spatial_stats = self._patch_stats(pixel_values, grid)
+        spatial = self.spatial_proj(spatial_stats)
+        if vision_embeds is not None:
+            vision = self._vision_grid(vision_embeds.float(), grid)
+            vision = self.vision_proj(vision)
+            gate = self.spatial_gate(torch.cat([spatial, vision], dim=-1))
+            spatial = gate * vision + (1.0 - gate) * spatial
 
         fft_map = torch.fft.fft2(pixel_values, norm="ortho")
         freq = torch.log1p(torch.abs(torch.fft.fftshift(fft_map, dim=(-2, -1))))
-        freq = self._patch_stats(freq, grid)
+        low = F.interpolate(
+            F.avg_pool2d(pixel_values, kernel_size=5, stride=1, padding=2),
+            size=pixel_values.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        high_residual = (pixel_values - low).abs()
+        freq = torch.cat([self._patch_stats(freq, grid), self._patch_stats(high_residual, grid)], dim=-1)
         freq = self.frequency_proj(freq)
 
         position_ids = torch.arange(grid * grid, device=pixel_values.device).unsqueeze(0)
@@ -54,6 +81,16 @@ class PatchGraphEncoder(nn.Module):
         )
         text_mask = attention_mask[:, : text_ids.shape[1]].bool()
         text = self.text_embedding(text_ids)
+        if self.config.forensic_nodes > 0:
+            forensic = self.forensic_nodes.unsqueeze(0).expand(batch_size, -1, -1)
+            forensic_mask = torch.ones(
+                batch_size,
+                self.config.forensic_nodes,
+                dtype=torch.bool,
+                device=text.device,
+            )
+            text = torch.cat([forensic, text], dim=1)
+            text_mask = torch.cat([forensic_mask, text_mask], dim=1)
 
         spatial_type = torch.zeros(spatial.shape[:2], dtype=torch.long, device=spatial.device)
         freq_type = torch.ones(freq.shape[:2], dtype=torch.long, device=freq.device)
@@ -74,6 +111,24 @@ class PatchGraphEncoder(nn.Module):
         )
 
         edge_types, edge_mask = self._build_graph_topology(batch_size, grid, text.shape[1], nodes.device)
+        if self.config.semantic_top_k > 0:
+            image_nodes = grid * grid
+            edge_types = edge_types.clone()
+            edge_mask = edge_mask.clone()
+            self._add_semantic_knn_edges(
+                edge_types=edge_types,
+                edge_mask=edge_mask,
+                features=spatial,
+                start=0,
+                top_k=self.config.semantic_top_k,
+            )
+            self._add_semantic_knn_edges(
+                edge_types=edge_types,
+                edge_mask=edge_mask,
+                features=freq,
+                start=image_nodes,
+                top_k=self.config.semantic_top_k,
+            )
         return nodes, node_mask, edge_types, edge_mask
 
     @staticmethod
@@ -83,6 +138,26 @@ class PatchGraphEncoder(nn.Module):
         std = (sq_mean - mean.square()).clamp_min(1e-6).sqrt()
         stats = torch.cat([mean, std], dim=1)
         return stats.flatten(2).transpose(1, 2)
+
+    @staticmethod
+    def _vision_grid(vision_embeds: torch.Tensor, grid: int):
+        batch_size, num_tokens, hidden_dim = vision_embeds.shape
+        patch_tokens = vision_embeds
+        patch_count = num_tokens - 1
+        patch_side = int(math.sqrt(patch_count))
+        if patch_count > 0 and patch_side * patch_side == patch_count:
+            patch_tokens = vision_embeds[:, 1:, :]
+            num_tokens = patch_count
+        else:
+            patch_side = int(math.sqrt(num_tokens))
+
+        if patch_side * patch_side == num_tokens:
+            patch_map = patch_tokens.transpose(1, 2).reshape(batch_size, hidden_dim, patch_side, patch_side)
+            pooled = F.adaptive_avg_pool2d(patch_map, (grid, grid))
+            return pooled.flatten(2).transpose(1, 2)
+
+        pooled = F.adaptive_avg_pool1d(patch_tokens.transpose(1, 2), grid * grid)
+        return pooled.transpose(1, 2)
 
     @staticmethod
     def _local_grid_mask(grid: int, device: torch.device):
@@ -99,6 +174,26 @@ class PatchGraphEncoder(nn.Module):
                             dst = dst_row * grid + dst_col
                             mask[src, dst] = True
         return mask
+
+    @staticmethod
+    def _add_semantic_knn_edges(
+        edge_types: torch.Tensor,
+        edge_mask: torch.Tensor,
+        features: torch.Tensor,
+        start: int,
+        top_k: int,
+    ):
+        batch_size, num_nodes, _ = features.shape
+        k = max(1, min(top_k + 1, num_nodes))
+        normed = F.normalize(features.float(), dim=-1)
+        similarity = torch.matmul(normed, normed.transpose(1, 2))
+        knn = similarity.topk(k=k, dim=-1).indices
+        batch_index = torch.arange(batch_size, device=features.device).view(batch_size, 1, 1)
+        src_index = torch.arange(num_nodes, device=features.device).view(1, num_nodes, 1)
+        src_index = src_index.expand(batch_size, num_nodes, k) + start
+        dst_index = knn + start
+        edge_mask[batch_index, src_index, dst_index] = True
+        edge_types[batch_index, src_index, dst_index] = 6
 
     @classmethod
     def _build_graph_topology(cls, batch_size: int, grid: int, text_nodes: int, device: torch.device):
@@ -143,7 +238,7 @@ class PatchGraphEncoder(nn.Module):
 
 
 class HeterogeneousGraphLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, num_edge_types: int = 6):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, num_edge_types: int = 7):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
@@ -216,6 +311,13 @@ class HeteroGNNCoTHead(nn.Module):
                 for _ in range(config.num_layers)
             ]
         )
+        self.readout = nn.Sequential(
+            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim // 2, 1),
+        )
         self.classifier = nn.Sequential(
             nn.LayerNorm(config.hidden_dim),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -230,18 +332,27 @@ class HeteroGNNCoTHead(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         cls_labels: Optional[torch.Tensor] = None,
+        vision_embeds: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        nodes, node_mask, edge_types, edge_mask = self.encoder(pixel_values, input_ids, attention_mask)
+        nodes, node_mask, edge_types, edge_mask = self.encoder(
+            pixel_values,
+            input_ids,
+            attention_mask,
+            vision_embeds=vision_embeds,
+        )
         last_attn = None
         for layer in self.layers:
             nodes, last_attn = layer(nodes, node_mask, edge_types, edge_mask)
 
-        pooled = (nodes * node_mask.unsqueeze(-1)).sum(dim=1) / node_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        readout_scores = self.readout(nodes).squeeze(-1).masked_fill(~node_mask, torch.finfo(nodes.dtype).min)
+        readout_weights = torch.softmax(readout_scores, dim=-1)
+        pooled = torch.sum(nodes * readout_weights.unsqueeze(-1), dim=1)
         logits = self.classifier(pooled)
-        output = {"logits": logits, "graph_repr": pooled}
+        output = {"logits": logits, "graph_repr": pooled, "readout_weights": readout_weights}
         if last_attn is not None:
             output["attn"] = last_attn
-            output["node_importance"] = self._node_importance(last_attn, node_mask)
+            attention_importance = self._node_importance(last_attn, node_mask)
+            output["node_importance"] = 0.5 * attention_importance + 0.5 * readout_weights
             image_nodes = self.config.image_grid_size * self.config.image_grid_size
             grid = self.config.image_grid_size
             output["spatial_importance"] = output["node_importance"][:, :image_nodes].reshape(-1, grid, grid)
@@ -376,7 +487,18 @@ class StructuredCoTReward(nn.Module):
         return torch.stack(rewards)
 
 
-def build_gnn_cot_head(tokenizer, hidden_dim: int, text_max_nodes: int, image_grid_size: int, num_layers: int, num_heads: int, dropout: float):
+def build_gnn_cot_head(
+    tokenizer,
+    hidden_dim: int,
+    text_max_nodes: int,
+    image_grid_size: int,
+    num_layers: int,
+    num_heads: int,
+    dropout: float,
+    visual_feature_dim: int = 1408,
+    forensic_nodes: int = 8,
+    semantic_top_k: int = 4,
+):
     vocab_size = len(tokenizer)
     config = GNNCoTConfig(
         vocab_size=vocab_size,
@@ -386,6 +508,9 @@ def build_gnn_cot_head(tokenizer, hidden_dim: int, text_max_nodes: int, image_gr
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
+        visual_feature_dim=visual_feature_dim,
+        forensic_nodes=forensic_nodes,
+        semantic_top_k=semantic_top_k,
     )
     return HeteroGNNCoTHead(config)
 
@@ -397,9 +522,49 @@ def save_gnn_cot_head(head: HeteroGNNCoTHead, save_path: str):
 def load_gnn_cot_head(save_path: str, tokenizer, map_location=None):
     payload = torch.load(save_path, map_location=map_location)
     config_dict = dict(payload["config"])
+    config_dict.setdefault("vocab_size", len(tokenizer))
     head = HeteroGNNCoTHead(GNNCoTConfig(**config_dict))
     head.load_state_dict(payload["state_dict"])
     return head
+
+
+def _unwrap_blip2_model(model):
+    if hasattr(model, "get_base_model"):
+        try:
+            model = model.get_base_model()
+        except TypeError:
+            pass
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        model = model.base_model.model
+    if hasattr(model, "model") and hasattr(model.model, "vision_model"):
+        model = model.model
+    return model
+
+
+def infer_blip2_vision_dim(model, default: int = 1408) -> int:
+    core = _unwrap_blip2_model(model)
+    config = getattr(core, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+    hidden_size = getattr(vision_config, "hidden_size", None)
+    return int(hidden_size) if hidden_size is not None else int(default)
+
+
+def extract_blip2_vision_tokens(model, pixel_values: torch.Tensor) -> Optional[torch.Tensor]:
+    core = _unwrap_blip2_model(model)
+    vision_model = getattr(core, "vision_model", None)
+    if vision_model is None:
+        return None
+    was_training = vision_model.training
+    vision_model.eval()
+    with torch.no_grad():
+        outputs = vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+    if was_training:
+        vision_model.train()
+    return outputs.last_hidden_state.detach()
 
 
 def format_top_patches(graph_outputs: Dict[str, torch.Tensor], top_k: int = 3) -> List[str]:
